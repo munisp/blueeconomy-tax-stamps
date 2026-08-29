@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import select
@@ -16,7 +17,7 @@ from taxstamps.services.verification import VerificationError, void_stamp
 router = APIRouter(prefix="/v1")
 
 
-def _batch_view(b: StampBatch) -> dict:
+def _batch_view(b: StampBatch) -> dict[str, Any]:
     return {
         "batchId": str(b.id),
         "assessmentId": str(b.assessment_id),
@@ -36,7 +37,7 @@ async def create_batch(
     session: SessionDep,
     settings: SettingsDep,
     identity: IdentityDep,
-) -> dict:
+) -> dict[str, Any]:
     require_policy(request, identity, "batch", "issue", "CONFIDENTIAL")
     assessment = (
         await session.execute(select(Assessment).where(Assessment.id == assessment_id))
@@ -62,7 +63,7 @@ async def issue_batch(
     session: SessionDep,
     settings: SettingsDep,
     identity: IdentityDep,
-) -> dict:
+) -> dict[str, Any]:
     """Issue one chunk, or run to completion (resumable; safe to retry)."""
     require_policy(request, identity, "batch", "issue", "CONFIDENTIAL")
     batch = (
@@ -99,7 +100,7 @@ async def finalize_batch(
     request: Request,
     session: SessionDep,
     identity: IdentityDep,
-) -> dict:
+) -> dict[str, Any]:
     require_policy(request, identity, "batch", "issue", "CONFIDENTIAL")
     batch = (
         await session.execute(select(StampBatch).where(StampBatch.id == batch_id))
@@ -127,7 +128,7 @@ async def inspect_batch(
     request: Request,
     session: SessionDep,
     identity: IdentityDep,
-) -> dict:
+) -> dict[str, Any]:
     require_policy(request, identity, "batch", "inspect", "CONFIDENTIAL")
     batch = (
         await session.execute(select(StampBatch).where(StampBatch.id == batch_id))
@@ -164,7 +165,7 @@ async def activate_batch(
     request: Request,
     session: SessionDep,
     identity: IdentityDep,
-) -> dict:
+) -> dict[str, Any]:
     require_policy(request, identity, "batch", "activate", "CONFIDENTIAL")
     batch = (
         await session.execute(select(StampBatch).where(StampBatch.id == batch_id))
@@ -191,7 +192,7 @@ async def get_stamp(
     request: Request,
     session: SessionDep,
     identity: IdentityDep,
-) -> dict:
+) -> dict[str, Any]:
     require_policy(request, identity, "stamp", "read", "CONFIDENTIAL")
     stamp = (
         await session.execute(select(Stamp).where(Stamp.serial == serial.strip().upper()))
@@ -220,7 +221,7 @@ async def void_stamp_route(
     session: SessionDep,
     settings: SettingsDep,
     identity: IdentityDep,
-) -> dict:
+) -> dict[str, Any]:
     require_policy(request, identity, "stamp", "void", "CONFIDENTIAL")
     try:
         stamp = await void_stamp(

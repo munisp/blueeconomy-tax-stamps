@@ -28,15 +28,18 @@ def problem(status: int, title: str, detail: str = "", type_: str = "about:blank
 
 
 def get_settings_dep(request: Request) -> Settings:
-    return request.app.state.settings
+    settings: Settings = request.app.state.settings
+    return settings
 
 
 def get_signing_key(request: Request) -> SigningKey:
-    return request.app.state.signing_key
+    key: SigningKey = request.app.state.signing_key
+    return key
 
 
 def get_policy_engine(request: Request) -> PolicyEngine:
-    return request.app.state.policy_engine
+    engine: PolicyEngine = request.app.state.policy_engine
+    return engine
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:

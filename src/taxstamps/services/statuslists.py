@@ -9,6 +9,8 @@ GET /v1/status-list/{purpose}.
 
 from __future__ import annotations
 
+from typing import Any
+
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -92,7 +94,7 @@ async def set_flag(
     await session.flush()
 
 
-async def current_credential(session: AsyncSession, purpose: str) -> dict | None:
+async def current_credential(session: AsyncSession, purpose: str) -> dict[str, Any] | None:
     row = (
         await session.execute(
             select(StatusListSnapshot)

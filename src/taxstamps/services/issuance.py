@@ -19,6 +19,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, text
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from taxstamps.config import Settings
@@ -314,6 +315,7 @@ async def activate_batch(
         ),
         {"now": now, "bid": locked.id},
     )
+    assert isinstance(result, CursorResult)
     locked.status = "ACTIVE"
     await outbox.enqueue(
         session,

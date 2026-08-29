@@ -96,7 +96,8 @@ class JwksKeyring:
         entry = self._keys.get(kid)
         if entry is None:
             raise AuthError("unknown-kid", kid)
-        return entry
+        alg, key = entry
+        return str(alg), key
 
 
 def verify_bearer(token: str, keyring: JwksKeyring, settings: Settings) -> Identity:

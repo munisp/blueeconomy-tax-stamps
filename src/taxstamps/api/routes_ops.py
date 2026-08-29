@@ -3,6 +3,8 @@ issuer key and status-list publication."""
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import text
 
@@ -25,7 +27,7 @@ async def readyz(session: SessionDep) -> dict[str, str]:
 
 
 @router.get("/v1/capabilities")
-async def v1_capabilities(request: Request, settings: SettingsDep, session: SessionDep) -> dict:
+async def v1_capabilities(request: Request, settings: SettingsDep, session: SessionDep) -> dict[str, Any]:
     runtime: dict[str, bool | str] = {}
     try:
         await session.execute(text("SELECT 1"))
@@ -46,7 +48,7 @@ async def v1_capabilities(request: Request, settings: SettingsDep, session: Sess
 
 
 @router.get("/v1/ops/audit-chain")
-async def audit_chain_verify(session: SessionDep) -> dict:
+async def audit_chain_verify(session: SessionDep) -> dict[str, Any]:
     result = await audit.verify_chain(session)
     return {
         "ok": result.ok,
@@ -57,7 +59,7 @@ async def audit_chain_verify(session: SessionDep) -> dict:
 
 
 @router.get("/v1/issuers/{issuer}/key")
-async def issuer_key(issuer: str, request: Request, settings: SettingsDep) -> dict:
+async def issuer_key(issuer: str, request: Request, settings: SettingsDep) -> dict[str, Any]:
     """Public issuer Ed25519 key for offline eddsa-jcs-2022 verification."""
     if issuer != settings.issuer_did:
         raise HTTPException(status_code=404, detail="unknown issuer")
@@ -66,7 +68,7 @@ async def issuer_key(issuer: str, request: Request, settings: SettingsDep) -> di
 
 
 @router.get("/v1/status-list/{purpose}")
-async def status_list(purpose: str, session: SessionDep) -> dict:
+async def status_list(purpose: str, session: SessionDep) -> dict[str, Any]:
     if purpose not in PURPOSES:
         raise HTTPException(status_code=404, detail="unknown status list")
     credential = await statuslists.current_credential(session, purpose)

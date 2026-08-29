@@ -11,6 +11,8 @@ POST /v1/verify/public — importer/consumer self-service: no device credential;
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import select
 
@@ -35,6 +37,7 @@ async def _authenticate_verifier(session, verifier_id: str, credential: str) -> 
     ).scalar_one_or_none()
     if row is None or not row.active:
         raise HTTPException(status_code=401, detail={"reason": "unknown-verifier"})
+    assert isinstance(row, VerifierCredential)
     import hmac
 
     presented = hash_verifier_credential(verifier_id, credential)
@@ -49,7 +52,7 @@ async def verify(
     request: Request,
     session: SessionDep,
     settings: SettingsDep,
-) -> dict:
+) -> dict[str, Any]:
     verifier_id = request.headers.get("x-verifier-id", "")
     credential = request.headers.get("x-verifier-credential", "")
     verifier = await _authenticate_verifier(session, verifier_id, credential)
@@ -86,7 +89,7 @@ async def verify_public(
     request: Request,
     session: SessionDep,
     settings: SettingsDep,
-) -> dict:
+) -> dict[str, Any]:
     """Self-service verification: no device credential. Rate-limited by client
     address when Redis is configured; when Redis is configured-but-down the
     endpoint is fail-closed like the authenticated one."""
@@ -102,7 +105,7 @@ async def verify_public(
             ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=429, detail={"reason": "rate-limit", "detail": str(exc)}) from exc
-    response: dict = {}
+    response: dict[str, Any] = {}
     serial = body.serial
     if body.credential is not None:
         subject = body.credential.get("credentialSubject", {})

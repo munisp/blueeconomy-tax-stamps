@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, date, datetime
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -75,7 +76,7 @@ class Declaration(Base):
     consignee_name: Mapped[str] = mapped_column(String(256), default="")
     source_event_id: Mapped[str] = mapped_column(String(128), unique=True)  # envelope eventId dedupe
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    envelope: Mapped[dict] = mapped_column(JSONB)  # full verified envelope v1.0
+    envelope: Mapped[dict[str, Any]] = mapped_column(JSONB)  # full verified envelope v1.0
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -288,7 +289,7 @@ class Stamp(Base):
     consignee_tin: Mapped[str] = mapped_column(String(32))
     duty_paid_kobo: Mapped[int] = mapped_column(BigInteger)
     status_list_index: Mapped[int] = mapped_column(Integer, unique=True)
-    credential: Mapped[dict] = mapped_column(JSONB)  # the signed W3C VC (QR payload)
+    credential: Mapped[dict[str, Any]] = mapped_column(JSONB)  # the signed W3C VC (QR payload)
     valid_from: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -361,7 +362,7 @@ class IdempotencyRecord(Base):
     principal_sub: Mapped[str] = mapped_column(String(256), primary_key=True)
     request_hash: Mapped[str] = mapped_column(String(64))
     response_status: Mapped[int] = mapped_column(Integer)
-    response_body: Mapped[dict] = mapped_column(JSONB)
+    response_body: Mapped[dict[str, Any]] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -370,7 +371,7 @@ class OutboxMessage(Base):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     topic: Mapped[str] = mapped_column(String(128))
     key: Mapped[str] = mapped_column(String(128))
-    envelope: Mapped[dict] = mapped_column(JSONB)  # envelope v1.0, JWS-signed
+    envelope: Mapped[dict[str, Any]] = mapped_column(JSONB)  # envelope v1.0, JWS-signed
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
@@ -384,7 +385,7 @@ class AuditEvent(Base):
     prev_hash: Mapped[str] = mapped_column(String(64))
     hash: Mapped[str] = mapped_column(String(64), unique=True)
     event_type: Mapped[str] = mapped_column(String(64))
-    payload: Mapped[dict] = mapped_column(JSONB)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -394,7 +395,7 @@ class StatusListSnapshot(Base):
     __tablename__ = "status_list_snapshots"
     purpose: Mapped[str] = mapped_column(String(16), primary_key=True)
     version: Mapped[int] = mapped_column(Integer, primary_key=True)
-    credential: Mapped[dict] = mapped_column(JSONB)
+    credential: Mapped[dict[str, Any]] = mapped_column(JSONB)
     published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

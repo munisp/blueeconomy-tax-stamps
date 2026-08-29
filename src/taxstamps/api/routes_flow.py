@@ -4,6 +4,7 @@ assessment creation, maker-checker decisions, and payment rails."""
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import select
@@ -32,7 +33,7 @@ from taxstamps.services.payments import PaymentError
 router = APIRouter(prefix="/v1")
 
 
-def _assessment_view(a: Assessment) -> dict:
+def _assessment_view(a: Assessment) -> dict[str, Any]:
     return {
         "assessmentId": str(a.id),
         "declarationId": str(a.declaration_id),
@@ -53,7 +54,7 @@ async def create_declaration(
     session: SessionDep,
     identity: IdentityDep,
     idem_key: IdempotencyKey,
-) -> dict:
+) -> dict[str, Any]:
     require_policy(request, identity, "assessment", "create", "INTERNAL")
     replay = await idempotent_replay(session, idem_key, identity.subject, body.model_dump())
     if replay is not None:
@@ -106,7 +107,7 @@ async def create_assessment(
     session: SessionDep,
     identity: IdentityDep,
     idem_key: IdempotencyKey,
-) -> dict:
+) -> dict[str, Any]:
     require_policy(request, identity, "assessment", "create", "CONFIDENTIAL")
     replay = await idempotent_replay(session, idem_key, identity.subject, body.model_dump())
     if replay is not None:
@@ -164,7 +165,7 @@ async def get_assessment(
     request: Request,
     session: SessionDep,
     identity: IdentityDep,
-) -> dict:
+) -> dict[str, Any]:
     require_policy(request, identity, "assessment", "read", "CONFIDENTIAL")
     assessment = (
         await session.execute(select(Assessment).where(Assessment.id == assessment_id))
@@ -181,7 +182,7 @@ async def decide_assessment(
     request: Request,
     session: SessionDep,
     identity: IdentityDep,
-) -> dict:
+) -> dict[str, Any]:
     require_policy(request, identity, "assessment", "approve", "CONFIDENTIAL")
     try:
         assessment = await assessments.record_decision(
@@ -221,7 +222,7 @@ async def create_payment_intent(
     session: SessionDep,
     settings: SettingsDep,
     identity: IdentityDep,
-) -> dict:
+) -> dict[str, Any]:
     require_policy(request, identity, "payment", "create", "FIDUCIARY_SEGREGATED")
     assessment = (
         await session.execute(select(Assessment).where(Assessment.id == assessment_id))
@@ -255,7 +256,7 @@ async def record_payment_receipt(
     request: Request,
     session: SessionDep,
     identity: IdentityDep,
-) -> dict:
+) -> dict[str, Any]:
     """Rail callback boundary (financial-controls reports the remittance)."""
     require_policy(request, identity, "payment", "settle", "FIDUCIARY_SEGREGATED")
     intent = (

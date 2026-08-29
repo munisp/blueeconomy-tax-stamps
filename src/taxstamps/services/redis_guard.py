@@ -23,7 +23,9 @@ def init_redis(settings: Settings) -> aioredis.Redis | None:
     if not settings.redis_configured:
         _client = None
         return None
-    _client = aioredis.from_url(settings.redis_url, socket_timeout=2.0, socket_connect_timeout=2.0)
+    _client = aioredis.from_url(  # type: ignore[no-untyped-call]
+        settings.redis_url, socket_timeout=2.0, socket_connect_timeout=2.0
+    )
     return _client
 
 
