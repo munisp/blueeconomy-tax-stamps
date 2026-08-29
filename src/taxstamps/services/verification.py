@@ -27,7 +27,7 @@ from taxstamps.config import Settings
 from taxstamps.crypto.eddsa import SigningKey
 from taxstamps.crypto.vc import VCError, verify_proof
 from taxstamps.domain.serials import SerialError, parse_serial
-from taxstamps.models import Stamp, Verification, utcnow
+from taxstamps.models import Stamp, Verification
 from taxstamps.services import outbox, statuslists
 
 

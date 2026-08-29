@@ -16,7 +16,7 @@ import base64
 import hashlib
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -150,4 +150,4 @@ def verify_bearer(token: str, keyring: JwksKeyring, settings: Settings) -> Ident
 def hash_verifier_credential(verifier_id: str, credential: str) -> str:
     """Keyed hash of a per-verifier bearer credential; the raw credential is
     never stored. There is no shared fleet secret."""
-    return hashlib.sha256(f"verifier:{verifier_id}:{credential}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"verifier:{verifier_id}:{credential}".encode()).hexdigest()

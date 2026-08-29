@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     financial_controls_endpoint: str = ""
 
     # --- service ---
-    http_host: str = "0.0.0.0"
+    http_host: str = "0.0.0.0"  # noqa: S104 -- container listener, ingress-terminated
     http_port: int = 8080
     status_list_base_url: str = ""      # public base for status-list credential ids
     stamp_validity_days: int = 365
