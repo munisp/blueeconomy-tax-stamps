@@ -72,6 +72,55 @@ async def test_high_tier_requires_three_approvals(session):
     assert assessment.status == "APPROVED"
 
 
+# ------------------------------------------------- cancellation (TS-4)
+
+
+async def test_cancelled_assessment_blocks_issuance(session, settings):
+    from taxstamps.services import issuance
+    from taxstamps.services.issuance import IssuanceError
+
+    declaration = await make_declaration(session)
+    assessment = await assessments.create_assessment(
+        session, declaration=declaration, submitted_by="m", idempotency_key="idem-cx-1",
+        on_date=date(2026, 8, 1),
+    )
+    assessment = await assessments.record_decision(
+        session, assessment_id=assessment.id, principal_sub="c1", decision="APPROVE",
+    )
+    cancelled = await assessments.cancel_assessment(
+        session, assessment_id=assessment.id, principal_sub="approver-1",
+        reason="declaration withdrawn by importer",
+    )
+    await session.commit()
+    assert cancelled.status == "CANCELLED"
+    # payment path blocked
+    from taxstamps.services.payments import PaymentError, create_intent
+
+    rail = settings.model_copy(update={
+        "payment_rail": "cvff-tigerbeetle",
+        "financial_controls_endpoint": "https://financial-controls.example",
+    })
+    with pytest.raises(PaymentError, match="invalid-state"):
+        await create_intent(session, settings=rail, assessment=cancelled)
+    # issuance blocked
+    with pytest.raises(IssuanceError, match="invalid-state"):
+        await issuance.create_batch(session, assessment=cancelled, settings=settings)
+    await session.rollback()
+
+
+async def test_cancel_requires_reason_and_pre_issuance_state(session, settings):
+    declaration = await make_declaration(session)
+    assessment = await assessments.create_assessment(
+        session, declaration=declaration, submitted_by="m", idempotency_key="idem-cx-2",
+        on_date=date(2026, 8, 1),
+    )
+    with pytest.raises(AssessmentError, match="reason-required"):
+        await assessments.cancel_assessment(
+            session, assessment_id=assessment.id, principal_sub="a", reason=" ",
+        )
+    await session.rollback()
+
+
 async def test_rejection_is_terminal(session):
     declaration = await make_declaration(session)
     assessment = await assessments.create_assessment(
