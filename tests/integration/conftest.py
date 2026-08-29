@@ -78,7 +78,8 @@ async def session(migrated_url: str) -> AsyncSession:
     # isolate tests: truncate all data tables (order matters for FKs)
     async with engine.begin() as conn:
         await conn.execute(text("""
-            TRUNCATE verifications, inspections, stamps, stamp_batches, serial_counters,
+            TRUNCATE verifications, inspections, stamps, stamp_batches, stamp_void_requests,
+                     serial_counters,
                      ledger_entries, journals, payment_receipts, payment_intents,
                      approvals, assessment_lines, assessments, declaration_lines,
                      declarations, idempotency_records, outbox_messages, audit_events,
@@ -95,7 +96,8 @@ async def session_factory(migrated_url: str):
     yield factory
     async with engine.begin() as conn:
         await conn.execute(text("""
-            TRUNCATE verifications, inspections, stamps, stamp_batches, serial_counters,
+            TRUNCATE verifications, inspections, stamps, stamp_batches, stamp_void_requests,
+                     serial_counters,
                      ledger_entries, journals, payment_receipts, payment_intents,
                      approvals, assessment_lines, assessments, declaration_lines,
                      declarations, idempotency_records, outbox_messages, audit_events,
@@ -108,6 +110,71 @@ async def session_factory(migrated_url: str):
 @pytest.fixture(scope="session")
 def signing_key() -> SigningKey:
     return SigningKey(kid="blueeconomy-tax-stamps-0", private_key=Ed25519PrivateKey.generate())
+
+
+@pytest.fixture()
+def oidc_client(migrated_url, tmp_path, monkeypatch):
+    """HTTP client against the real app with OIDC configured (local JWKS).
+
+    Yields (client, mint) where ``mint(sub, roles)`` produces a valid EdDSA
+    bearer token, so PBAC-protected routes can be exercised end-to-end with
+    verified token claims only.
+    """
+    import base64
+    import json
+    import stat
+    import time
+
+    signing = Ed25519PrivateKey.generate()
+    key_path = tmp_path / "ed25519.pem"
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+        PublicFormat,
+    )
+
+    key_path.write_bytes(signing.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
+    key_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    kid = "test-oidc-key-1"
+    x = base64.urlsafe_b64encode(
+        signing.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    ).rstrip(b"=").decode()
+    jwks_path = tmp_path / "jwks.json"
+    jwks_path.write_text(json.dumps({"keys": [{"kty": "OKP", "crv": "Ed25519", "kid": kid, "x": x}]}))
+    issuer = "https://keycloak.test/realms/blueeconomy"
+    monkeypatch.setenv("TAXSTAMPS_DATABASE_URL", migrated_url)
+    monkeypatch.setenv("TAXSTAMPS_SIGNING_KEY_PATH", str(key_path))
+    monkeypatch.setenv("TAXSTAMPS_ISSUER_DID", "did:web:taxstamps.blueeconomy.gov.ng")
+    monkeypatch.setenv("TAXSTAMPS_POLICY_DIR", "policies")
+    monkeypatch.setenv("TAXSTAMPS_OIDC_JWKS_PATH", str(jwks_path))
+    monkeypatch.setenv("TAXSTAMPS_OIDC_ISSUER", issuer)
+    monkeypatch.delenv("TAXSTAMPS_OIDC_JWKS_URL", raising=False)
+    monkeypatch.delenv("TAXSTAMPS_REDIS_URL", raising=False)
+    monkeypatch.delenv("TAXSTAMPS_KAFKA_BOOTSTRAP_SERVERS", raising=False)
+    monkeypatch.delenv("TAXSTAMPS_PAYMENT_RAIL", raising=False)
+    from taxstamps.config import get_settings
+
+    get_settings.cache_clear()
+    from fastapi.testclient import TestClient
+
+    from taxstamps.main import app
+
+    def _b64(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    def mint(sub: str, roles: list[str]) -> str:
+        header = _b64(json.dumps({"alg": "EdDSA", "typ": "JWT", "kid": kid}).encode())
+        payload = _b64(json.dumps({
+            "iss": issuer, "sub": sub, "exp": int(time.time()) + 600,
+            "realm_access": {"roles": roles},
+        }).encode())
+        signing_input = f"{header}.{payload}"
+        return f"{signing_input}.{_b64(signing.sign(signing_input.encode()))}"
+
+    with TestClient(app) as c:
+        yield c, mint
+    get_settings.cache_clear()
 
 
 @pytest.fixture()
