@@ -27,6 +27,12 @@ from taxstamps.models import (
     utcnow,
 )
 from taxstamps.services.journal import post_journal
+from taxstamps.telemetry import get_tracer
+
+# Phase-7 OTel: manual spans on the settlement path. No-op tracer unless
+# OTEL_EXPORTER_OTLP_ENDPOINT is set; attributes stay low-cardinality
+# (rail/status/resolution — never account, assessment or reference ids).
+_tracer = get_tracer("taxstamps.settlement")
 
 
 class PaymentError(ValueError):
@@ -96,13 +102,26 @@ async def settle_zero_rated(
         )
     if assessment.status != "APPROVED":
         raise PaymentError("invalid-state", f"assessment is {assessment.status}, expected APPROVED")
-    existing = (
-        await session.execute(
-            select(PaymentIntent).where(PaymentIntent.assessment_id == assessment.id)
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
-        return existing
+    with _tracer.start_as_current_span("taxstamps.settlement.zero_rated") as span:
+        span.set_attribute("settlement.rail", "zero-rated")
+        existing = (
+            await session.execute(
+                select(PaymentIntent).where(PaymentIntent.assessment_id == assessment.id)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            span.set_attribute("settlement.outcome", "idempotent-replay")
+            return existing
+        intent = await _settle_zero_rated(session, assessment=assessment)
+        span.set_attribute("settlement.outcome", "settled")
+        return intent
+
+
+async def _settle_zero_rated(
+    session: AsyncSession,
+    *,
+    assessment: Assessment,
+) -> PaymentIntent:
     locked = (
         await session.execute(
             select(Assessment).where(Assessment.id == assessment.id).with_for_update()
@@ -138,6 +157,27 @@ async def record_receipt(
     receipt row is returned); a conflicting amount under a replayed reference
     cannot occur because the reference is unique and receipts are immutable.
     """
+    with _tracer.start_as_current_span("taxstamps.settlement.receipt") as span:
+        span.set_attribute("settlement.rail", intent.rail)
+        receipt = await _record_receipt(
+            session,
+            intent=intent,
+            external_reference=external_reference,
+            amount_kobo=amount_kobo,
+            currency=currency,
+        )
+        span.set_attribute("settlement.receipt_status", receipt.status)
+        return receipt
+
+
+async def _record_receipt(
+    session: AsyncSession,
+    *,
+    intent: PaymentIntent,
+    external_reference: str,
+    amount_kobo: int,
+    currency: str,
+) -> PaymentReceipt:
     existing = (
         await session.execute(
             select(PaymentReceipt).where(PaymentReceipt.external_reference == external_reference)
@@ -241,6 +281,33 @@ async def resolve_quarantine(
         raise PaymentError("invalid-resolution", resolution)
     if not reason or not reason.strip():
         raise PaymentError("reason-required", "quarantine resolution requires a reason")
+    with _tracer.start_as_current_span("taxstamps.settlement.quarantine_resolution") as span:
+        span.set_attribute("settlement.resolution", resolution)
+        receipt = await _resolve_quarantine(
+            session,
+            intent=intent,
+            resolution=resolution,
+            external_reference=external_reference,
+            supersedes_reference=supersedes_reference,
+            amount_kobo=amount_kobo,
+            currency=currency,
+            reason=reason,
+        )
+        span.set_attribute("settlement.receipt_status", receipt.status)
+        return receipt
+
+
+async def _resolve_quarantine(
+    session: AsyncSession,
+    *,
+    intent: PaymentIntent,
+    resolution: str,
+    external_reference: str,
+    supersedes_reference: str,
+    amount_kobo: int,
+    currency: str,
+    reason: str,
+) -> PaymentReceipt:
     existing = (
         await session.execute(
             select(PaymentReceipt).where(PaymentReceipt.external_reference == external_reference)

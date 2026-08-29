@@ -145,7 +145,15 @@ async def consume_forever() -> None:
 
 def run_consumer() -> None:
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(consume_forever())
+    # OTel (Phase-7): no-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset; when
+    # set, consumed records extract the W3C traceparent from Kafka headers.
+    from taxstamps import telemetry
+
+    telemetry.init_telemetry(None, service_name="blueeconomy-tax-stamps-consumer", version="0.1.0")
+    try:
+        asyncio.run(consume_forever())
+    finally:
+        telemetry.shutdown_telemetry()
 
 
 if __name__ == "__main__":

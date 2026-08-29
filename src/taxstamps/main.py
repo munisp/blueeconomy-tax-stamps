@@ -58,8 +58,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     init_engine(settings.database_url)
     redis_guard.init_redis(settings)
     app.state.kafka_available = settings.kafka_configured
+    # OTel (Phase-7): no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set — the
+    # sanctioned fail-open; settlement never depends on telemetry.
+    from taxstamps import telemetry
+
+    telemetry.init_telemetry(app, service_name="blueeconomy-tax-stamps", version="0.1.0")
     log.info("blueeconomy-tax-stamps booted (kid=%s)", settings.kid)
     yield
+    telemetry.shutdown_telemetry()
     await redis_guard.close_redis()
     await dispose_engine()
 
