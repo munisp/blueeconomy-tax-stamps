@@ -1,0 +1,95 @@
+{
+  "version": "1.0",
+  "policies": [
+    {
+      "name": "excise-officer-submits-assessments",
+      "roles": ["excise-officer", "customs-officer"],
+      "resource": "assessment",
+      "action": "create",
+      "tenant": "*",
+      "clearance": ["*"],
+      "classification": ["INTERNAL", "CONFIDENTIAL"]
+    },
+    {
+      "name": "excise-approver-approves-assessments",
+      "roles": ["excise-approver"],
+      "resource": "assessment",
+      "action": "approve",
+      "tenant": "*",
+      "clearance": ["*"],
+      "classification": ["INTERNAL", "CONFIDENTIAL"]
+    },
+    {
+      "name": "excise-approver-creates-payment-intents",
+      "roles": ["excise-approver", "finance-officer"],
+      "resource": "payment",
+      "action": "create",
+      "tenant": "*",
+      "clearance": ["*"],
+      "classification": ["FIDUCIARY_SEGREGATED", "CONFIDENTIAL"]
+    },
+    {
+      "name": "rail-callback-records-receipts",
+      "roles": ["finance-rail-callback"],
+      "resource": "payment",
+      "action": "settle",
+      "tenant": "*",
+      "clearance": ["*"],
+      "classification": ["FIDUCIARY_SEGREGATED"]
+    },
+    {
+      "name": "excise-officer-issues-batches",
+      "roles": ["excise-officer"],
+      "resource": "batch",
+      "action": "issue",
+      "tenant": "*",
+      "clearance": ["*"],
+      "classification": ["CONFIDENTIAL"]
+    },
+    {
+      "name": "quality-inspector-records-inspections",
+      "roles": ["quality-inspector"],
+      "resource": "batch",
+      "action": "inspect",
+      "tenant": "*",
+      "clearance": ["*"],
+      "classification": ["CONFIDENTIAL"]
+    },
+    {
+      "name": "excise-officer-activates-batches",
+      "roles": ["excise-officer", "excise-approver"],
+      "resource": "batch",
+      "action": "activate",
+      "tenant": "*",
+      "clearance": ["*"],
+      "classification": ["CONFIDENTIAL"]
+    },
+    {
+      "name": "excise-approver-voids-stamps",
+      "roles": ["excise-approver"],
+      "resource": "stamp",
+      "action": "void",
+      "tenant": "*",
+      "clearance": ["*"],
+      "classification": ["CONFIDENTIAL"]
+    },
+    {
+      "name": "officers-read-stamps-and-batches",
+      "roles": ["excise-officer", "excise-approver", "quality-inspector", "finance-officer", "auditor"],
+      "resource": "*",
+      "action": "read",
+      "tenant": "*",
+      "clearance": ["*"],
+      "classification": ["*"]
+    },
+    {
+      "name": "auditor-runs-ops-verification",
+      "roles": ["auditor"],
+      "resource": "ops",
+      "action": "read",
+      "tenant": "*",
+      "clearance": ["*"],
+      "classification": ["*"]
+    }
+  ]
+}

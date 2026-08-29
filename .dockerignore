@@ -1,0 +1,15 @@
+.git
+.github
+tests
+ci
+keys/*.pem
+keys/*.json
+!keys/README.md
+**/__pycache__
+**/*.pyc
+.venv
+.env
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache

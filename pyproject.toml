@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blueeconomy-tax-stamps"
+version = "0.1.0"
+description = "Declaration-linked excise tax stamps (VC-based) for the BlueEconomy PPP platform"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = [
+    # All dependencies are permissively licensed (MIT / Apache-2.0 / BSD).
+    "fastapi>=0.115,<1",            # MIT
+    "uvicorn[standard]>=0.30,<1",   # BSD-3-Clause
+    "sqlalchemy[asyncio]>=2.0,<3",  # MIT
+    "alembic>=1.13,<2",             # MIT
+    "asyncpg>=0.29,<1",             # Apache-2.0
+    "redis>=5,<7",                  # MIT
+    "pydantic>=2.7,<3",             # MIT
+    "pydantic-settings>=2.3,<3",    # MIT
+    "cryptography>=42,<46",         # Apache-2.0 / BSD-3-Clause
+    "aiokafka>=0.10,<1",            # Apache-2.0
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",          # MIT
+    "pytest-asyncio>=0.23,<1",# Apache-2.0
+    "httpx>=0.27,<1",         # BSD-3-Clause
+    "ruff>=0.5,<1",           # MIT
+    "mypy>=1.10,<2",          # MIT
+]
+
+[project.scripts]
+taxstamps-api = "taxstamps.main:run_api"
+taxstamps-consumer = "taxstamps.events.consumer:run_consumer"
+taxstamps-outbox = "taxstamps.events.outbox_publisher:run_publisher"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "S", "UP", "B"]
+ignore = ["S101"]  # asserts are required in tests
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+strict = true
+ignore_missing_imports = true
