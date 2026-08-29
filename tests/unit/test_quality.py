@@ -49,9 +49,12 @@ def test_accept_reject_boundary():
     assert evaluate_sample(plan, 1) is False
 
 
+def test_single_unit_lot_is_full_inspection():
+    plan = plan_for_lot(1)
+    assert plan.sample_size == 1 and plan.accept == 0 and plan.hundred_percent
+
+
 def test_invalid_inputs():
-    with pytest.raises(SamplingError):
-        plan_for_lot(1)
     with pytest.raises(SamplingError):
         plan_for_lot(0)
     with pytest.raises(SamplingError):

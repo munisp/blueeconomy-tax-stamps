@@ -55,8 +55,11 @@ def test_jws_reason_codes(signing_key, directory):
     assert e2.value.reason == "malformed-jws"
 
     parts = jws.split(".")
+    # flip a character in the middle of the signature segment
+    flip = "A" if parts[2][10] != "A" else "B"
+    bad_sig = parts[2][:10] + flip + parts[2][11:]
     with pytest.raises(JwsError) as e3:
-        jws_verify(".".join([parts[0], parts[1], parts[2][:-2] + "AA"]), directory)
+        jws_verify(".".join([parts[0], parts[1], bad_sig]), directory)
     assert e3.value.reason == "invalid-signature"
 
 

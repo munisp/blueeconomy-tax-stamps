@@ -91,8 +91,12 @@ def _code_letter_for(lot_size: int) -> str:
 
 def plan_for_lot(lot_size: int) -> SamplingPlan:
     """Return the single-sampling normal GIL-II plan at AQL 0.65% for a lot."""
-    if not isinstance(lot_size, int) or lot_size < 2:
-        raise SamplingError("lot size must be an integer >= 2")
+    if not isinstance(lot_size, int) or lot_size < 1:
+        raise SamplingError("lot size must be a positive integer")
+    if lot_size == 1:
+        # Single-unit lot: 100% inspection, zero defectives tolerated.
+        return SamplingPlan(lot_size=1, code_letter="A", sample_size=1,
+                            accept=0, reject=1, hundred_percent=True)
     letter = _code_letter_for(lot_size)
     plan_letter = letter if letter in _PLANS_AQL_0_65 else _ARROW_TARGET
     accept, reject = _PLANS_AQL_0_65[plan_letter]

@@ -139,8 +139,6 @@ async def record_decision(
     ).scalar_one_or_none()
     if assessment is None:
         raise AssessmentError("not-found", "assessment not found")
-    if assessment.status != "PENDING_APPROVAL":
-        raise AssessmentError("invalid-state", f"assessment is {assessment.status}")
     if decision not in ("APPROVE", "REJECT"):
         raise AssessmentError("invalid-decision", decision)
     if principal_sub == assessment.submitted_by:
@@ -154,6 +152,8 @@ async def record_decision(
     ).scalar_one()
     if already:
         raise AssessmentError("duplicate-decision", "principal already decided on this assessment")
+    if assessment.status != "PENDING_APPROVAL":
+        raise AssessmentError("invalid-state", f"assessment is {assessment.status}")
     level = (
         await session.execute(
             select(func.count()).select_from(Approval).where(Approval.assessment_id == assessment_id)
@@ -180,8 +180,9 @@ async def record_decision(
                 )
             )
         ).scalar_one()
-        # +1 for the decision being recorded in this flush
-        if approvals + 1 >= assessment.approvals_required:
+        # autoflush has already flushed the decision recorded above, so
+        # ``approvals`` includes it
+        if approvals >= assessment.approvals_required:
             assessment.status = "APPROVED"
             assessment.decided_at = utcnow()
     await session.flush()

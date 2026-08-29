@@ -61,7 +61,7 @@ def upgrade() -> None:
     op.create_table(
         "declaration_lines",
         sa.Column("id", _uuid(), primary_key=True),
-        sa.Column("declaration_id", _uuid(), sa.ForeignKey("declarations.id"), nullable=False, index=True),
+        sa.Column("declaration_id", _uuid(), sa.ForeignKey("declarations.id"), nullable=False),
         sa.Column("hs_code", sa.String(16), nullable=False),
         sa.Column("description", sa.Text(), nullable=False, server_default=""),
         sa.Column("quantity", sa.BigInteger(), nullable=False),

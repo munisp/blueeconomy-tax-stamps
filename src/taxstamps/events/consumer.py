@@ -37,53 +37,68 @@ log = logging.getLogger("taxstamps.consumer")
 _REQUIRED_RESOURCE_FIELDS = {"declarationRef", "consigneeTin", "lineItems"}
 
 
-async def apply_declaration_envelope(envelope: dict[str, Any], directory: KeyDirectory) -> str:
+async def apply_declaration_envelope(
+    envelope: dict[str, Any],
+    directory: KeyDirectory,
+    db_session: Any = None,
+) -> str:
     """Verify + persist one declaration envelope. Returns a disposition:
-    'applied' | 'duplicate'. Raises EnvelopeError/ValueError on rejection."""
+    'applied' | 'duplicate'. Raises EnvelopeError/ValueError on rejection.
+
+    When ``db_session`` is supplied the caller owns the transaction/commit;
+    otherwise a session is opened and committed here (consumer path)."""
     resource = verify_envelope(envelope, directory)
     missing = _REQUIRED_RESOURCE_FIELDS - set(resource)
     if missing:
         raise ValueError(f"declaration resource missing fields {sorted(missing)}")
+    if db_session is not None:
+        return await _apply(db_session, envelope, resource)
+    async with session() as s:
+        disposition = await _apply(s, envelope, resource)
+        await s.commit()
+        return disposition
+
+
+async def _apply(s: Any, envelope: dict[str, Any], resource: dict[str, Any]) -> str:
     event_id = envelope["eventId"]
     lines = resource["lineItems"]
     if not isinstance(lines, list) or not lines:
         raise ValueError("lineItems must be a non-empty array")
-    async with session() as s:
-        seen = (
-            await s.execute(select(ProcessedEvent).where(ProcessedEvent.event_id == event_id))
-        ).scalar_one_or_none()
-        if seen is not None:
-            return "duplicate"
-        declaration = Declaration(
-            id=uuid.uuid4(),
-            declaration_ref=str(resource["declarationRef"]),
-            consignee_tin=str(resource["consigneeTin"]),
-            consignee_name=str(resource.get("consigneeName", "")),
-            source_event_id=event_id,
-            occurred_at=utcnow(),
-            envelope=envelope,
-        )
-        s.add(declaration)
-        for raw in lines:
-            s.add(
-                DeclarationLine(
-                    id=uuid.uuid4(),
-                    declaration_id=declaration.id,
-                    hs_code=str(raw["hsCode"]),
-                    description=str(raw.get("description", "")),
-                    quantity=int(raw["quantity"]),
-                    unit=str(raw["unit"]),
-                    customs_value_kobo=int(raw.get("customsValueKobo", 0)),
-                    stamps_required=int(raw.get("stampsRequired", raw["quantity"])),
-                )
+    seen = (
+        await s.execute(select(ProcessedEvent).where(ProcessedEvent.event_id == event_id))
+    ).scalar_one_or_none()
+    if seen is not None:
+        return "duplicate"
+    declaration = Declaration(
+        id=uuid.uuid4(),
+        declaration_ref=str(resource["declarationRef"]),
+        consignee_tin=str(resource["consigneeTin"]),
+        consignee_name=str(resource.get("consigneeName", "")),
+        source_event_id=event_id,
+        occurred_at=utcnow(),
+        envelope=envelope,
+    )
+    s.add(declaration)
+    for raw in lines:
+        s.add(
+            DeclarationLine(
+                id=uuid.uuid4(),
+                declaration_id=declaration.id,
+                hs_code=str(raw["hsCode"]),
+                description=str(raw.get("description", "")),
+                quantity=int(raw["quantity"]),
+                unit=str(raw["unit"]),
+                customs_value_kobo=int(raw.get("customsValueKobo", 0)),
+                stamps_required=int(raw.get("stampsRequired", raw["quantity"])),
             )
-        s.add(ProcessedEvent(event_id=event_id, event_type=envelope["eventType"]))
-        await audit.record(s, "declaration.received", {
-            "declarationRef": declaration.declaration_ref,
-            "eventId": event_id,
-            "producer": envelope.get("producer", ""),
-        })
-        await s.commit()
+        )
+    s.add(ProcessedEvent(event_id=event_id, event_type=envelope["eventType"]))
+    await audit.record(s, "declaration.received", {
+        "declarationRef": declaration.declaration_ref,
+        "eventId": event_id,
+        "producer": envelope.get("producer", ""),
+    })
+    await s.flush()
     return "applied"
 
 
