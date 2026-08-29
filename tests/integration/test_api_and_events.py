@@ -112,3 +112,53 @@ async def test_redis_nonce_replay_and_rate_limit(monkeypatch):
     finally:
         await redis_guard.get_redis().flushdb()
         await redis_guard.close_redis()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("TAXSTAMPS_TEST_REDIS_URL"),
+    reason="TAXSTAMPS_TEST_REDIS_URL not set",
+)
+def test_public_scan_per_serial_throttle(migrated_url, tmp_path, monkeypatch):
+    """TS-6: the non-consuming public path is throttled per serial (beyond
+    per-IP) when Redis is present."""
+    import stat
+    import uuid
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+    )
+
+    key_path = tmp_path / "ed25519.pem"
+    key_path.write_bytes(
+        Ed25519PrivateKey.generate().private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+    )
+    key_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    monkeypatch.setenv("TAXSTAMPS_DATABASE_URL", migrated_url)
+    monkeypatch.setenv("TAXSTAMPS_SIGNING_KEY_PATH", str(key_path))
+    monkeypatch.setenv("TAXSTAMPS_ISSUER_DID", "did:web:taxstamps.blueeconomy.gov.ng")
+    monkeypatch.setenv("TAXSTAMPS_POLICY_DIR", "policies")
+    monkeypatch.setenv("TAXSTAMPS_REDIS_URL", os.environ["TAXSTAMPS_TEST_REDIS_URL"])
+    monkeypatch.setenv("TAXSTAMPS_PUBLIC_SERIAL_RATE_LIMIT_PER_MINUTE", "3")
+    monkeypatch.delenv("TAXSTAMPS_OIDC_JWKS_URL", raising=False)
+    monkeypatch.delenv("TAXSTAMPS_OIDC_JWKS_PATH", raising=False)
+    monkeypatch.delenv("TAXSTAMPS_OIDC_ISSUER", raising=False)
+    from taxstamps.config import get_settings
+
+    get_settings.cache_clear()
+    from fastapi.testclient import TestClient
+
+    from taxstamps.main import app
+
+    # unique serial per run: the throttle bucket must start cold
+    serial = f"NG-TBC-2026-{uuid.uuid4().int % 10**10:010d}-X"
+    with TestClient(app) as c:
+        codes = [
+            c.post("/v1/verify/public", json={"serial": serial}).status_code
+            for _ in range(5)
+        ]
+    get_settings.cache_clear()
+    assert codes[:3] == [200, 200, 200]
+    assert codes[3:] == [429, 429]

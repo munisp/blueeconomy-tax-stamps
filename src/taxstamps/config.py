@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     velocity_window_hours: int = 24
     velocity_distinct_devices: int = 3
     rate_limit_per_minute: int = 120
+    # Anomaly throttle for the NON-CONSUMING public scan path: per-serial
+    # scan-rate cap (beyond per-IP) when Redis is present.
+    public_serial_rate_limit_per_minute: int = 10
 
     @field_validator("database_url")
     @classmethod
