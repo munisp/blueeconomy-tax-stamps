@@ -36,6 +36,7 @@ dev = [
 taxstamps-api = "taxstamps.main:run_api"
 taxstamps-consumer = "taxstamps.events.consumer:run_consumer"
 taxstamps-outbox = "taxstamps.events.outbox_publisher:run_publisher"
+taxstamps-expiry-sweeper = "taxstamps.events.expiry_sweeper:run_sweeper"
 
 [tool.setuptools.packages.find]
 where = ["src"]
