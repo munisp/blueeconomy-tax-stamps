@@ -93,8 +93,19 @@ def generate_pkcs8_pem() -> bytes:
 _PLACEHOLDER_MARKERS = ("CHANGE_ME", "CHANGEME", "PLACEHOLDER", "DUMMY", "EXAMPLE-KEY", "REPLACE_ME")
 
 
+def _is_production() -> bool:
+    return os.environ.get("ENV", "").strip().lower() in {"production", "prod"}
+
+
 def load_signing_key(path: str, kid: str) -> SigningKey:
     """Load the PKCS#8 PEM signing key; refuse placeholder/dummy material."""
+    if _is_production() and os.environ.get("TAXSTAMPS_ALLOW_PERMISSIVE_KEY_FILE"):
+        # Fail-closed: the permissive-mode escape hatch is a development
+        # convenience and must never be armed in production.
+        raise JwsError(
+            "permissive-key-file-refused",
+            "TAXSTAMPS_ALLOW_PERMISSIVE_KEY_FILE is forbidden when ENV=production",
+        )
     p = Path(path)
     if not p.is_file() or p.is_symlink():
         raise JwsError("key-unavailable", f"signing key {path} is not a regular non-symlink file")
