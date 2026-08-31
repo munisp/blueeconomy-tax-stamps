@@ -35,7 +35,7 @@ micro-degrees only) are prohibited.
 ## Workflow
 
 ```
-declaration event (Kafka declarations.*, envelope v1.0, JWS-verified)
+declaration event (Kafka trade.declarations.v1, envelope v1.0, JWS-verified)
   → TaxStampAssessment (server-side tariff pricing)
   → maker-checker approval (submitter-cannot-approve; risk tiers LOW/STANDARD/HIGH = 1/2/3 approvers)
   → payment intent + rail receipt (financial-controls boundary; EXACT amount+currency match; mismatch QUARANTINED)
@@ -124,7 +124,10 @@ PKCS#8 PEM, file-mounted, `0600`, never committed),
 
 Optional (fail-closed consumers when absent): `TAXSTAMPS_REDIS_URL`,
 `TAXSTAMPS_KEY_DIRECTORY_PATH` (inbound envelope verification),
-`TAXSTAMPS_KAFKA_BOOTSTRAP_SERVERS`, `TAXSTAMPS_OIDC_JWKS_URL` /
+`TAXSTAMPS_KAFKA_BOOTSTRAP_SERVERS`,
+`TAXSTAMPS_KAFKA_DECLARATIONS_TOPIC_PATTERN` (default
+`trade.declarations.v1`, the blueeconomy-port-interoperability producer
+topic; `*` wildcard supported), `TAXSTAMPS_OIDC_JWKS_URL` /
 `TAXSTAMPS_OIDC_JWKS_PATH` + `TAXSTAMPS_OIDC_ISSUER` (+`_AUDIENCE`),
 `TAXSTAMPS_PAYMENT_RAIL` + `TAXSTAMPS_FINANCIAL_CONTROLS_ENDPOINT`,
 `TAXSTAMPS_STATUS_LIST_BASE_URL`, plus tuning vars documented in
@@ -133,7 +136,7 @@ Optional (fail-closed consumers when absent): `TAXSTAMPS_REDIS_URL`,
 ## Processes
 
 One image, three entrypoints: `taxstamps-api` (HTTP),
-`taxstamps-consumer` (`declarations.*` Kafka consumer, envelope-verified,
+`taxstamps-consumer` (`trade.declarations.v1` Kafka consumer, envelope-verified,
 deduped on eventId, offset committed after DB commit), `taxstamps-outbox`
 (outbox publisher). Migrations: `alembic upgrade head`
 (`TAXSTAMPS_DATABASE_URL` required).

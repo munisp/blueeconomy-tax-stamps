@@ -1,4 +1,4 @@
-"""declarations.* Kafka consumer.
+"""trade.declarations.v1 Kafka consumer.
 
 Consumes customs declaration events in canonical envelope v1.0 (FHIR message
 Bundle wrap, JWS-EdDSA signature verified against the mounted key directory —
@@ -6,7 +6,11 @@ fail-closed: rejected envelopes are never persisted), persists the
 declaration + line items, dedupes on the envelope eventId, and commits the
 Kafka offset only after the database commit.
 
-Expected primary resource (declarations.imported.v1 style), carried as the
+Subscribed topic is governed by ``kafka_declarations_topic_pattern``
+(default ``trade.declarations.v1``, the only real declaration producer in
+the platform: blueeconomy-port-interoperability).
+
+Expected primary resource (CustomsDeclarationFiled style), carried as the
 FHIR Bundle's single entry resource:
 
   {"@type": "...CustomsDeclarationFiled", "declarationRef": "...",
@@ -35,6 +39,13 @@ from taxstamps.services import audit
 log = logging.getLogger("taxstamps.consumer")
 
 _REQUIRED_RESOURCE_FIELDS = {"declarationRef", "consigneeTin", "lineItems"}
+
+
+def topic_pattern_regex(pattern: str) -> str:
+    """Compile a settings topic pattern (``.``-separated, ``*`` wildcard)
+    into an anchored regular expression, e.g. ``trade.declarations.v1`` ->
+    ``^trade\\.declarations\\.v1$``."""
+    return "^" + pattern.replace(".", r"\.").replace("*", ".*") + "$"
 
 
 async def apply_declaration_envelope(
@@ -114,7 +125,7 @@ async def consume_forever() -> None:
 
     init_engine(settings.database_url)
     directory = KeyDirectory.load(settings.key_directory_path)
-    pattern = "^" + settings.kafka_declarations_topic_pattern.replace(".", r"\.").replace("*", ".*") + "$"
+    pattern = topic_pattern_regex(settings.kafka_declarations_topic_pattern)
     consumer = AIOKafkaConsumer(
         bootstrap_servers=settings.kafka_bootstrap_servers,
         group_id=settings.kafka_consumer_group,

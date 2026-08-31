@@ -34,7 +34,13 @@ class Settings(BaseSettings):
     redis_url: str = ""                 # nonce / rate-limit / velocity (fail-closed on outage)
     key_directory_path: str = ""        # {kid: b64u pubkey} for inbound envelope verification
     kafka_bootstrap_servers: str = ""   # outbox publisher + declarations consumer
-    kafka_declarations_topic_pattern: str = "declarations.*"
+    # Real producer contract (blueeconomy-port-interoperability,
+    # internal/events/envelope.go TopicDeclarations): topic
+    # "trade.declarations.v1", envelope v1.0 lifecycle events
+    # (trade.declaration.submitted.v1 ... trade.declaration.cleared.v1).
+    # The previous default "declarations.*" had no producer anywhere in the
+    # platform and left this consumer idle forever.
+    kafka_declarations_topic_pattern: str = "trade.declarations.v1"
     kafka_consumer_group: str = "blueeconomy-tax-stamps"
 
     # --- OIDC (Keycloak RS256/EdDSA via JWKS) ---
