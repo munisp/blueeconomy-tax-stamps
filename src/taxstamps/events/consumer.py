@@ -1,4 +1,4 @@
-"""declarations.* Kafka consumer.
+"""trade.declarations.v1 Kafka consumer.
 
 Consumes customs declaration events in canonical envelope v1.0 (FHIR message
 Bundle wrap, JWS-EdDSA signature verified against the mounted key directory —
@@ -6,7 +6,12 @@ fail-closed: rejected envelopes are never persisted), persists the
 declaration + line items, dedupes on the envelope eventId, and commits the
 Kafka offset only after the database commit.
 
-Expected primary resource (declarations.imported.v1 style), carried as the
+Subscribed topics are governed by ``kafka_declarations_topic_pattern``
+(comma-separated patterns; the default set includes
+``trade.declarations.v1``, the blueeconomy-port-interoperability producer
+topic).
+
+Expected primary resource (CustomsDeclarationFiled style), carried as the
 FHIR Bundle's single entry resource:
 
   {"@type": "...CustomsDeclarationFiled", "declarationRef": "...",
@@ -14,6 +19,12 @@ FHIR Bundle's single entry resource:
    "lineItems": [{"hsCode": "...", "description": "...", "quantity": n,
                   "unit": "STICK|LITRE|UNIT", "customsValueKobo": n,
                   "stampsRequired": n}]}
+
+The real producer (blueeconomy-port-interoperability) wraps its payload in
+a FHIR ``Basic`` resource whose ``domain-payload`` extension carries the
+Declaration JSON (snake_case, single ``hs_code``);
+``taxstamps.events.normalize`` maps that shape onto the structural resource
+per the configured event map; unrecognized/malformed payloads fail closed.
 """
 
 from __future__ import annotations
@@ -39,6 +50,18 @@ from taxstamps.services import audit
 log = logging.getLogger("taxstamps.consumer")
 
 _REQUIRED_RESOURCE_FIELDS = {"declarationRef", "consigneeTin", "lineItems"}
+
+
+def topic_patterns_regex(patterns: tuple[str, ...]) -> str:
+    """Compile the configured topic patterns (``.``-separated, ``*``
+    wildcard) into one anchored alternation regex, e.g.
+    ``("declarations.*", "trade.declarations.v1")`` ->
+    ``^(declarations\\..*|trade\\.declarations\\.v1)$``.
+    Fails closed on an empty pattern set."""
+    alternatives = [p.replace(".", r"\.").replace("*", ".*") for p in patterns]
+    if not alternatives:
+        raise RuntimeError("TAXSTAMPS_KAFKA_DECLARATIONS_TOPIC_PATTERN must not be empty")
+    return "^(" + "|".join(alternatives) + ")$"
 
 
 async def apply_declaration_envelope(
@@ -133,13 +156,7 @@ async def consume_forever() -> None:
 
     init_engine(settings.database_url)
     directory = KeyDirectory.load(settings.key_directory_path)
-    alternatives = [
-        p.replace(".", r"\.").replace("*", ".*")
-        for p in settings.kafka_declarations_topic_patterns
-    ]
-    if not alternatives:
-        raise RuntimeError("TAXSTAMPS_KAFKA_DECLARATIONS_TOPIC_PATTERN must not be empty")
-    pattern = "^(" + "|".join(alternatives) + ")$"
+    pattern = topic_patterns_regex(settings.kafka_declarations_topic_patterns)
     consumer = AIOKafkaConsumer(
         bootstrap_servers=settings.kafka_bootstrap_servers,
         group_id=settings.kafka_consumer_group,
