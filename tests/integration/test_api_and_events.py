@@ -35,7 +35,7 @@ def _declaration_envelope(event_id: str):
 async def test_consumer_applies_verified_envelope(session, signing_key):
     directory = KeyDirectory({signing_key.kid: signing_key.public_key})
     envelope = sign_envelope(_declaration_envelope("evt-k-1"), signing_key)
-    disposition = await apply_declaration_envelope(envelope, directory, db_session=session)
+    disposition = await apply_declaration_envelope(envelope, directory, db_session=session, trusted_kid_prefixes=())
     await session.commit()
     assert disposition == "applied"
     decl = (await session.execute(
@@ -51,9 +51,9 @@ async def test_consumer_applies_verified_envelope(session, signing_key):
 async def test_consumer_dedupes_replay(session, signing_key):
     directory = KeyDirectory({signing_key.kid: signing_key.public_key})
     envelope = sign_envelope(_declaration_envelope("evt-k-2"), signing_key)
-    assert await apply_declaration_envelope(envelope, directory, db_session=session) == "applied"
+    assert await apply_declaration_envelope(envelope, directory, db_session=session, trusted_kid_prefixes=()) == "applied"
     await session.commit()
-    assert await apply_declaration_envelope(envelope, directory, db_session=session) == "duplicate"
+    assert await apply_declaration_envelope(envelope, directory, db_session=session, trusted_kid_prefixes=()) == "duplicate"
     await session.commit()
     count = (await session.execute(select(func.count()).select_from(ProcessedEvent))).scalar_one()
     assert count == 1
@@ -66,7 +66,7 @@ async def test_consumer_rejects_forged_envelope(session, signing_key):
     from taxstamps.events.envelope import EnvelopeError
 
     with pytest.raises(EnvelopeError):
-        await apply_declaration_envelope(envelope, directory, db_session=session)
+        await apply_declaration_envelope(envelope, directory, db_session=session, trusted_kid_prefixes=())
     # rejected envelopes are never persisted
     count = (await session.execute(select(func.count()).select_from(Declaration))).scalar_one()
     assert count == 0
@@ -79,7 +79,7 @@ async def test_consumer_rejects_tampered_payload(session, signing_key):
     from taxstamps.events.envelope import EnvelopeError
 
     with pytest.raises(EnvelopeError) as exc:
-        await apply_declaration_envelope(envelope, directory, db_session=session)
+        await apply_declaration_envelope(envelope, directory, db_session=session, trusted_kid_prefixes=())
     assert exc.value.reason == "payload-mismatch"
 
 
@@ -112,3 +112,53 @@ async def test_redis_nonce_replay_and_rate_limit(monkeypatch):
     finally:
         await redis_guard.get_redis().flushdb()
         await redis_guard.close_redis()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("TAXSTAMPS_TEST_REDIS_URL"),
+    reason="TAXSTAMPS_TEST_REDIS_URL not set",
+)
+def test_public_scan_per_serial_throttle(migrated_url, tmp_path, monkeypatch):
+    """TS-6: the non-consuming public path is throttled per serial (beyond
+    per-IP) when Redis is present."""
+    import stat
+    import uuid
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+    )
+
+    key_path = tmp_path / "ed25519.pem"
+    key_path.write_bytes(
+        Ed25519PrivateKey.generate().private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+    )
+    key_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    monkeypatch.setenv("TAXSTAMPS_DATABASE_URL", migrated_url)
+    monkeypatch.setenv("TAXSTAMPS_SIGNING_KEY_PATH", str(key_path))
+    monkeypatch.setenv("TAXSTAMPS_ISSUER_DID", "did:web:taxstamps.blueeconomy.gov.ng")
+    monkeypatch.setenv("TAXSTAMPS_POLICY_DIR", "policies")
+    monkeypatch.setenv("TAXSTAMPS_REDIS_URL", os.environ["TAXSTAMPS_TEST_REDIS_URL"])
+    monkeypatch.setenv("TAXSTAMPS_PUBLIC_SERIAL_RATE_LIMIT_PER_MINUTE", "3")
+    monkeypatch.delenv("TAXSTAMPS_OIDC_JWKS_URL", raising=False)
+    monkeypatch.delenv("TAXSTAMPS_OIDC_JWKS_PATH", raising=False)
+    monkeypatch.delenv("TAXSTAMPS_OIDC_ISSUER", raising=False)
+    from taxstamps.config import get_settings
+
+    get_settings.cache_clear()
+    from fastapi.testclient import TestClient
+
+    from taxstamps.main import app
+
+    # unique serial per run: the throttle bucket must start cold
+    serial = f"NG-TBC-2026-{uuid.uuid4().int % 10**10:010d}-X"
+    with TestClient(app) as c:
+        codes = [
+            c.post("/v1/verify/public", json={"serial": serial}).status_code
+            for _ in range(5)
+        ]
+    get_settings.cache_clear()
+    assert codes[:3] == [200, 200, 200]
+    assert codes[3:] == [429, 429]

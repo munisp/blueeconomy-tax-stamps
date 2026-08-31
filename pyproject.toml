@@ -21,6 +21,17 @@ dependencies = [
     "pydantic-settings>=2.3,<3",    # MIT
     "cryptography>=42,<46",         # Apache-2.0 / BSD-3-Clause
     "aiokafka>=0.10,<1",            # Apache-2.0
+    "httpx>=0.27,<1",               # BSD-3-Clause (JWKS/keyring HTTP client)
+    # Phase-7 OTel wave: OTLP gRPC exporters + FastAPI/SQLAlchemy/redis/
+    # httpx/aiokafka auto-inst. Disabled (no-op) unless
+    # OTEL_EXPORTER_OTLP_ENDPOINT is set.
+    "opentelemetry-sdk>=1.27,<2",                      # Apache-2.0
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27,<2", # Apache-2.0
+    "opentelemetry-instrumentation-fastapi>=0.48b0",   # Apache-2.0
+    "opentelemetry-instrumentation-sqlalchemy>=0.48b0",# Apache-2.0
+    "opentelemetry-instrumentation-redis>=0.48b0",     # Apache-2.0
+    "opentelemetry-instrumentation-httpx>=0.48b0",     # Apache-2.0
+    "opentelemetry-instrumentation-aiokafka>=0.48b0",  # Apache-2.0
 ]
 
 [project.optional-dependencies]
@@ -36,6 +47,7 @@ dev = [
 taxstamps-api = "taxstamps.main:run_api"
 taxstamps-consumer = "taxstamps.events.consumer:run_consumer"
 taxstamps-outbox = "taxstamps.events.outbox_publisher:run_publisher"
+taxstamps-expiry-sweeper = "taxstamps.events.expiry_sweeper:run_sweeper"
 
 [tool.setuptools.packages.find]
 where = ["src"]

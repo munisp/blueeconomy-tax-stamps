@@ -26,6 +26,7 @@ from taxstamps.models import (
     Assessment,
     AssessmentLine,
     Declaration,
+    PaymentIntent,
     utcnow,
 )
 
@@ -119,6 +120,51 @@ async def create_assessment(
     assessment.stamps_required = stamps
     assessment.risk_tier = tier
     assessment.approvals_required = approvals
+    # Zero-rated (e.g. pharmaceuticals): every stamp-bearing line priced at
+    # zero duty. Such assessments settle through the zero-rated path, never
+    # through a payment rail.
+    assessment.zero_rated = total == 0
+    await session.flush()
+    return assessment
+
+
+# Statuses from which an assessment may still be cancelled (pre-issuance).
+_CANCELLABLE = ("PENDING_APPROVAL", "APPROVED", "PAYMENT_PENDING")
+
+
+async def cancel_assessment(
+    session: AsyncSession,
+    *,
+    assessment_id: uuid.UUID,
+    principal_sub: str,
+    reason: str,
+) -> Assessment:
+    """Cancel an assessment before issuance. Policy-gated and audited at the
+    API layer. A linked PENDING payment intent is FAILED with the same
+    reason so it cannot later be settled against a cancelled assessment."""
+    if not reason or not reason.strip():
+        raise AssessmentError("reason-required", "cancellation requires a reason")
+    assessment = (
+        await session.execute(
+            select(Assessment).where(Assessment.id == assessment_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if assessment is None:
+        raise AssessmentError("not-found", "assessment not found")
+    if assessment.status not in _CANCELLABLE:
+        raise AssessmentError(
+            "invalid-state",
+            f"assessment is {assessment.status}; only pre-issuance assessments can be cancelled",
+        )
+    assessment.status = "CANCELLED"
+    assessment.decided_at = utcnow()
+    intent = (
+        await session.execute(
+            select(PaymentIntent).where(PaymentIntent.assessment_id == assessment_id)
+        )
+    ).scalar_one_or_none()
+    if intent is not None and intent.status == "PENDING":
+        intent.status = "FAILED"
     await session.flush()
     return assessment
 

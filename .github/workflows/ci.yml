@@ -1,0 +1,56 @@
+# Example GitHub Actions workflow for blueeconomy-tax-stamps.
+#
+# NOTE: this file intentionally lives at ci/github-actions.yml.example and NOT
+# at .github/workflows/*. The automation token used to push this repository
+# lacks the `workflow` scope, so workflow files cannot be pushed. To enable CI,
+# a maintainer with workflow scope must copy this file to
+# .github/workflows/ci.yml unchanged.
+name: ci
+
+on:
+  push:
+    branches: [main, "feature/*"]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]'
+      - run: ruff check src tests
+      - run: mypy src/taxstamps
+      - run: pytest tests/unit -q
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: taxstamps
+          POSTGRES_PASSWORD: taxstamps-test
+          POSTGRES_DB: taxstamps_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U taxstamps"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      TAXSTAMPS_TEST_DATABASE_URL: postgresql+asyncpg://taxstamps:taxstamps-test@localhost:5432/taxstamps_test
+      TAXSTAMPS_TEST_REDIS_URL: redis://localhost:6379/15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]'
+      - run: pytest tests -q

@@ -6,9 +6,10 @@ fail-closed: rejected envelopes are never persisted), persists the
 declaration + line items, dedupes on the envelope eventId, and commits the
 Kafka offset only after the database commit.
 
-Subscribed topic is governed by ``kafka_declarations_topic_pattern``
-(default ``trade.declarations.v1``, the only real declaration producer in
-the platform: blueeconomy-port-interoperability).
+Subscribed topics are governed by ``kafka_declarations_topic_pattern``
+(comma-separated patterns; the default set includes
+``trade.declarations.v1``, the blueeconomy-port-interoperability producer
+topic).
 
 Expected primary resource (CustomsDeclarationFiled style), carried as the
 FHIR Bundle's single entry resource:
@@ -19,19 +20,16 @@ FHIR Bundle's single entry resource:
                   "unit": "STICK|LITRE|UNIT", "customsValueKobo": n,
                   "stampsRequired": n}]}
 
-The real producer (blueeconomy-port-interoperability,
-internal/events/envelope.go Message + internal/declarations/model.go
-Declaration) wraps its payload differently: the entry resource is a FHIR
-Basic whose ``domain-payload`` extension carries the Declaration JSON as a
-string (snake_case fields, a single ``hs_code``).
-``normalize_declaration_resource`` maps that shape explicitly onto the
-canonical form; unrecognized shapes fail closed.
+The real producer (blueeconomy-port-interoperability) wraps its payload in
+a FHIR ``Basic`` resource whose ``domain-payload`` extension carries the
+Declaration JSON (snake_case, single ``hs_code``);
+``taxstamps.events.normalize`` maps that shape onto the structural resource
+per the configured event map; unrecognized/malformed payloads fail closed.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import uuid
 from typing import Any
@@ -42,6 +40,10 @@ from taxstamps.config import get_settings
 from taxstamps.crypto.eddsa import KeyDirectory
 from taxstamps.db import dispose_engine, init_engine, session
 from taxstamps.events.envelope import EnvelopeError, verify_envelope
+from taxstamps.events.normalize import (
+    check_trusted_kid,
+    normalize_resource,
+)
 from taxstamps.models import Declaration, DeclarationLine, ProcessedEvent, utcnow
 from taxstamps.services import audit
 
@@ -50,110 +52,44 @@ log = logging.getLogger("taxstamps.consumer")
 _REQUIRED_RESOURCE_FIELDS = {"declarationRef", "consigneeTin", "lineItems"}
 
 
-def topic_pattern_regex(pattern: str) -> str:
-    """Compile a settings topic pattern (``.``-separated, ``*`` wildcard)
-    into an anchored regular expression, e.g. ``trade.declarations.v1`` ->
-    ``^trade\\.declarations\\.v1$``."""
-    return "^" + pattern.replace(".", r"\.").replace("*", ".*") + "$"
-
-
-# Extension URL under which blueeconomy-port-interoperability carries the
-# domain payload inside its FHIR Basic entry resource
-# (internal/events/envelope.go Message).
-_DOMAIN_PAYLOAD_EXTENSION_URL = (
-    "https://blueeconomy.gov.ng/fhir/StructureDefinition/domain-payload"
-)
-
-
-def normalize_declaration_resource(resource: dict[str, Any]) -> dict[str, Any]:
-    """Normalize the FHIR entry resource to the canonical declaration shape.
-
-    Accepted shapes:
-      1. Canonical (``declarationRef``/``consigneeTin``/``lineItems``
-         present) — returned unchanged.
-      2. blueeconomy-port-interoperability: a FHIR ``Basic`` resource whose
-         ``domain-payload`` extension ``valueString`` carries the
-         Declaration JSON (internal/declarations/model.go, snake_case,
-         single ``hs_code``). Mapped explicitly:
-           declaration_ref    -> declarationRef
-           consignee_id       -> consigneeTin (the consignee identifier)
-           hs_code            -> lineItems[0].hsCode
-           goods_description  -> lineItems[0].description
-           number_of_packages -> lineItems[0].quantity
-           unit               -> "UNIT" (the producer carries no excise unit)
-           invoice_amount_minor -> lineItems[0].customsValueKobo, only when
-                                 invoice_currency == "NGN" (mapping a foreign
-                                 minor unit to kobo would be fabrication)
-
-    Anything else, or a malformed/missing payload, fails closed with
-    ValueError — the envelope is rejected, never persisted.
-    """
-    if _REQUIRED_RESOURCE_FIELDS <= set(resource):
-        return resource
-    if resource.get("resourceType") != "Basic":
-        raise ValueError(
-            "declaration resource is neither canonical nor a port-interoperability FHIR Basic"
-        )
-    payload_raw: str | None = None
-    for extension in resource.get("extension") or []:
-        if isinstance(extension, dict) and extension.get("url") == _DOMAIN_PAYLOAD_EXTENSION_URL:
-            payload_raw = extension.get("valueString")
-            break
-    if not payload_raw:
-        raise ValueError("FHIR Basic resource carries no domain-payload extension")
-    try:
-        payload = json.loads(payload_raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"domain-payload extension is not valid JSON: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("domain-payload extension must decode to a JSON object")
-    declaration_ref = str(payload.get("declaration_ref") or "").strip()
-    consignee_id = str(payload.get("consignee_id") or "").strip()
-    hs_code = str(payload.get("hs_code") or "").strip()
-    if not declaration_ref or not consignee_id or not hs_code:
-        raise ValueError(
-            "port-interoperability declaration payload missing "
-            "declaration_ref/consignee_id/hs_code"
-        )
-    try:
-        quantity = int(payload.get("number_of_packages") or 0)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("number_of_packages must be an integer") from exc
-    if quantity < 1:
-        quantity = 1
-    customs_value_kobo = 0
-    if str(payload.get("invoice_currency") or "").upper() == "NGN":
-        try:
-            customs_value_kobo = int(payload.get("invoice_amount_minor") or 0)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("invoice_amount_minor must be an integer") from exc
-    return {
-        "declarationRef": declaration_ref,
-        "consigneeTin": consignee_id,
-        "consigneeName": "",
-        "lineItems": [
-            {
-                "hsCode": hs_code,
-                "description": str(payload.get("goods_description") or ""),
-                "quantity": quantity,
-                "unit": "UNIT",
-                "customsValueKobo": customs_value_kobo,
-            }
-        ],
-    }
+def topic_patterns_regex(patterns: tuple[str, ...]) -> str:
+    """Compile the configured topic patterns (``.``-separated, ``*``
+    wildcard) into one anchored alternation regex, e.g.
+    ``("declarations.*", "trade.declarations.v1")`` ->
+    ``^(declarations\\..*|trade\\.declarations\\.v1)$``.
+    Fails closed on an empty pattern set."""
+    alternatives = [p.replace(".", r"\.").replace("*", ".*") for p in patterns]
+    if not alternatives:
+        raise RuntimeError("TAXSTAMPS_KAFKA_DECLARATIONS_TOPIC_PATTERN must not be empty")
+    return "^(" + "|".join(alternatives) + ")$"
 
 
 async def apply_declaration_envelope(
     envelope: dict[str, Any],
     directory: KeyDirectory,
     db_session: Any = None,
+    *,
+    event_map: dict[str, str] | None = None,
+    trusted_kid_prefixes: tuple[str, ...] | None = None,
 ) -> str:
     """Verify + persist one declaration envelope. Returns a disposition:
     'applied' | 'duplicate'. Raises EnvelopeError/ValueError on rejection.
 
+    ``event_map`` / ``trusted_kid_prefixes`` default to the configured
+    producer-contract normalization (TAXSTAMPS_DECLARATION_EVENT_MAP /
+    TAXSTAMPS_TRUSTED_KID_PREFIXES); tests inject them explicitly.
+
     When ``db_session`` is supplied the caller owns the transaction/commit;
     otherwise a session is opened and committed here (consumer path)."""
-    resource = normalize_declaration_resource(verify_envelope(envelope, directory))
+    if event_map is None or trusted_kid_prefixes is None:
+        settings = get_settings()
+        if event_map is None:
+            event_map = settings.declaration_event_map_parsed
+        if trusted_kid_prefixes is None:
+            trusted_kid_prefixes = settings.trusted_kid_prefix_list
+    check_trusted_kid(envelope, trusted_kid_prefixes)
+    resource = verify_envelope(envelope, directory)
+    resource = normalize_resource(envelope, resource, event_map)
     missing = _REQUIRED_RESOURCE_FIELDS - set(resource)
     if missing:
         raise ValueError(f"declaration resource missing fields {sorted(missing)}")
@@ -220,7 +156,7 @@ async def consume_forever() -> None:
 
     init_engine(settings.database_url)
     directory = KeyDirectory.load(settings.key_directory_path)
-    pattern = topic_pattern_regex(settings.kafka_declarations_topic_pattern)
+    pattern = topic_patterns_regex(settings.kafka_declarations_topic_patterns)
     consumer = AIOKafkaConsumer(
         bootstrap_servers=settings.kafka_bootstrap_servers,
         group_id=settings.kafka_consumer_group,
@@ -251,7 +187,15 @@ async def consume_forever() -> None:
 
 def run_consumer() -> None:
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(consume_forever())
+    # OTel (Phase-7): no-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset; when
+    # set, consumed records extract the W3C traceparent from Kafka headers.
+    from taxstamps import telemetry
+
+    telemetry.init_telemetry(None, service_name="blueeconomy-tax-stamps-consumer", version="0.1.0")
+    try:
+        asyncio.run(consume_forever())
+    finally:
+        telemetry.shutdown_telemetry()
 
 
 if __name__ == "__main__":

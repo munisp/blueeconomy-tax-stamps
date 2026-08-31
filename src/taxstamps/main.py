@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 from taxstamps.api.auth import JwksKeyring
 from taxstamps.api.pbac import PolicyEngine
 from taxstamps.api.routes_flow import router as flow_router
+from taxstamps.api.routes_ops import ops_router as ops_secured_router
 from taxstamps.api.routes_ops import router as ops_router
 from taxstamps.api.routes_stamps import router as stamps_router
 from taxstamps.api.routes_verify import router as verify_router
@@ -57,8 +58,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     init_engine(settings.database_url)
     redis_guard.init_redis(settings)
     app.state.kafka_available = settings.kafka_configured
+    # OTel (Phase-7): no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set — the
+    # sanctioned fail-open; settlement never depends on telemetry.
+    from taxstamps import telemetry
+
+    telemetry.init_telemetry(app, service_name="blueeconomy-tax-stamps", version="0.1.0")
     log.info("blueeconomy-tax-stamps booted (kid=%s)", settings.kid)
     yield
+    telemetry.shutdown_telemetry()
     await redis_guard.close_redis()
     await dispose_engine()
 
@@ -100,6 +107,7 @@ async def unhandled_handler(request: Request, exc: Exception) -> JSONResponse:
 
 
 app.include_router(ops_router)
+app.include_router(ops_secured_router)
 app.include_router(flow_router)
 app.include_router(stamps_router)
 app.include_router(verify_router)
