@@ -1,6 +1,6 @@
 """Tax stamp serial numbers with a Luhn mod-N check digit.
 
-Format: ``NG-<CAT3>-<YYYY>-<SEQ10>-<CHECK>``  e.g. ``NG-TOB-2026-0000000042-7``.
+Format: ``NG-<CAT3>-<YYYY>-<SEQ10>-<CHECK>``  e.g. ``NG-TBC-2026-0000000042-7``.
 
 - ``CAT3``  three-letter excise category code (TBC/ALC/PHA/BEV) — letters I
   and O never appear in category codes so every body character is inside the
