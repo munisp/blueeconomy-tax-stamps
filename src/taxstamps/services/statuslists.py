@@ -32,14 +32,27 @@ class StatusListError_(ValueError):
 
 async def allocate_index(session: AsyncSession) -> int:
     """Allocate the next free status-list index (shared across purposes)."""
+    return await allocate_block(session, 1)
+
+
+async def allocate_block(session: AsyncSession, size: int) -> int:
+    """Allocate `size` consecutive free status-list indexes; returns the base.
+
+    One advisory lock + one MAX() probe covers the whole block, so issuing a
+    batch of N stamps costs 2 queries instead of 2N. Allocation semantics are
+    identical to N sequential allocate_index calls: indexes are handed out in
+    monotonically increasing order under the same transaction-scoped lock.
+    """
+    if size <= 0:
+        raise StatusListError_("allocation size must be positive")
     row = await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": 0x535441545553})  # noqa: F841
     current = (
         await session.execute(select(func.max(Stamp.status_list_index)))
     ).scalar_one()
-    nxt = (current + 1) if current is not None else 0
-    if nxt >= DEFAULT_LIST_SIZE_BITS:
+    base = (current + 1) if current is not None else 0
+    if base + size > DEFAULT_LIST_SIZE_BITS:
         raise StatusListError_("status list exhausted: rotate to a new list credential")
-    return nxt
+    return base
 
 
 def list_credential_id(settings: Settings, purpose: str) -> str:

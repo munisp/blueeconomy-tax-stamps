@@ -157,10 +157,12 @@ async def issue_chunk(
     entries = [
         status_entry(statuslists.list_credential_id(settings, p), 0, p) for p in ("void", "expired", "suspect")
     ]
+    # One block allocation covers the whole batch: 2 queries instead of 2*size.
+    status_base = await statuslists.allocate_block(session, size)
     for i in range(size):
         sequence = base + i
         serial = build_serial(locked.category_code, locked.year, sequence)
-        index = await statuslists.allocate_index(session)
+        index = status_base + i
         per_stamp_entries = [
             {**e, "id": f"{e['statusListCredential']}#{index}", "statusListIndex": str(index)}
             for e in entries

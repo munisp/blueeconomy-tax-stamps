@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     kafka_bootstrap_servers: str = ""   # outbox publisher + declarations consumer
     kafka_declarations_topic_pattern: str = "declarations.*"
     kafka_consumer_group: str = "blueeconomy-tax-stamps"
+    # Producer batching (outbox publisher). Defaults preserve the previous
+    # fire-and-await behavior: linger 0 and the aiokafka default batch size.
+    kafka_linger_ms: int = 0            # >0 lets the producer coalesce messages
+    kafka_max_batch_size: int = 16384   # aiokafka/kafka default
 
     # --- OIDC (Keycloak RS256/EdDSA via JWKS) ---
     oidc_jwks_url: str = ""             # https://keycloak/.../certs
