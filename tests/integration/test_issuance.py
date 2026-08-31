@@ -59,8 +59,37 @@ async def test_every_stamp_vc_verifies(session, settings, signing_key):
         verify_proof(stamp.credential, signing_key.public_key)
         subject = stamp.credential["credentialSubject"]
         assert subject["serial"] == stamp.serial
-        assert subject["declarationRef"] == stamp.declaration_ref
+        assert subject["stampScope"] == "unit"
+        assert subject["batchId"] == str(batch.id)
         assert len(stamp.credential["credentialStatus"]) == 3
+
+
+async def test_unit_stamp_credential_hides_consignment_duty(session, settings, signing_key):
+    """TS-1: the public unit credential carries no consignment-duty field;
+    consignment duty stays resolvable via the assessment reference only."""
+    assessment, batch = await _paid_batch(session, settings, stamps=10)
+    await issuance.issue_chunk(session, batch=batch, settings=settings,
+                               signing_key=signing_key, chunk_size=10)
+    await session.commit()
+    stamps = (await session.execute(select(Stamp).where(Stamp.batch_id == batch.id))).scalars().all()
+    for stamp in stamps:
+        subject = stamp.credential["credentialSubject"]
+        assert "dutyPaidKobo" not in subject
+        assert "consigneeTin" not in subject
+        assert "declarationRef" not in subject
+        # unit-scoped references only
+        assert subject["assessmentRef"] == str(assessment.id)
+    # authorized resolution path: the internal (policy-gated) record still
+    # resolves the full assessment with its duty amount
+    from taxstamps.models import Assessment
+
+    resolved = (await session.execute(
+        select(Assessment).where(Assessment.id == assessment.id)
+    )).scalar_one()
+    assert resolved.total_duty_kobo > 0
+    assert resolved.status in ("ISSUING", "ISSUED")
+
+
 
 
 async def test_finalize_computes_merkle_and_outbox(session, settings, signing_key):
@@ -139,6 +168,52 @@ async def test_activation_flow(session, settings, signing_key):
         "SELECT count(*) FROM outbox_messages WHERE topic = 'stamps.activated'"
     ))).scalar_one()
     assert rows == 1
+
+
+# ------------------------------------------------- lifecycle states (TS-4)
+
+
+async def test_full_lifecycle_reaches_issued(session, settings, signing_key):
+    """TS-4: assessment transitions to ISSUED when its batch reaches READY."""
+    assessment, batch = await _paid_batch(session, settings, stamps=10)
+    while await issuance.issue_chunk(session, batch=batch, settings=settings, signing_key=signing_key):
+        pass
+    batch = await issuance.finalize_batch(session, batch=batch, signing_key=signing_key,
+                                          principal_sub="officer-1")
+    await session.commit()
+    assert batch.status == "READY"
+    from taxstamps.models import Assessment
+
+    fresh = (await session.execute(
+        select(Assessment).where(Assessment.id == assessment.id)
+    )).scalar_one()
+    assert fresh.status == "ISSUED"
+
+
+async def test_batch_completes_when_all_stamps_consumed(session, settings, signing_key):
+    """TS-4: batch -> COMPLETED once every stamp is in a terminal state."""
+    from taxstamps.services import verification
+
+    _, batch = await _paid_batch(session, settings, stamps=4)
+    while await issuance.issue_chunk(session, batch=batch, settings=settings, signing_key=signing_key):
+        pass
+    batch = await issuance.finalize_batch(session, batch=batch, signing_key=signing_key,
+                                          principal_sub="officer-1")
+    await issuance.record_inspection(session, batch=batch, defectives=0, inspector_sub="qa-1")
+    await issuance.activate_batch(session, batch=batch, signing_key=signing_key,
+                                  principal_sub="officer-1")
+    await session.commit()
+    stamps = (await session.execute(select(Stamp).where(Stamp.batch_id == batch.id))).scalars().all()
+    for i, stamp in enumerate(stamps):
+        r = await verification.verify_stamp(
+            session, serial=stamp.serial, verifier_id=f"dev-{i}", public_scan=False,
+            settings=settings, signing_key=signing_key,
+        )
+        assert r["outcome"] == "valid"
+    await session.commit()
+    fresh = (await session.execute(select(StampBatch).where(StampBatch.id == batch.id))).scalar_one()
+    assert fresh.status == "COMPLETED"
+    assert fresh.completed_at is not None
 
 
 async def test_batch_requires_paid(session, settings):

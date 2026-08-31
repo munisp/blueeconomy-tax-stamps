@@ -19,6 +19,7 @@ from taxstamps.api.deps import (
     require_policy,
     store_idempotency,
 )
+from taxstamps.config import Settings
 from taxstamps.crypto.eddsa import SigningKey
 from taxstamps.models import (
     Assessment,
@@ -215,6 +216,33 @@ async def decide_assessment(
     return _assessment_view(assessment)
 
 
+@router.post("/assessments/{assessment_id}/cancel")
+async def cancel_assessment(
+    assessment_id: uuid.UUID,
+    body: schemas.CancelIn,
+    request: Request,
+    session: SessionDep,
+    identity: IdentityDep,
+) -> dict[str, Any]:
+    """Cancel a pre-issuance assessment (excise-approver tier; audited)."""
+    require_policy(request, identity, "assessment", "approve", "CONFIDENTIAL")
+    try:
+        assessment = await assessments.cancel_assessment(
+            session, assessment_id=assessment_id,
+            principal_sub=identity.subject, reason=body.reason,
+        )
+    except assessments.AssessmentError as exc:
+        status = 404 if exc.reason == "not-found" else 422
+        raise HTTPException(status_code=status, detail={"reason": exc.reason, "detail": str(exc)}) from exc
+    await audit.record(session, "assessment.cancelled", {
+        "assessmentId": str(assessment_id),
+        "reason": body.reason,
+        "principal": identity.subject,
+    })
+    await session.commit()
+    return _assessment_view(assessment)
+
+
 @router.post("/assessments/{assessment_id}/payment-intent", status_code=201)
 async def create_payment_intent(
     assessment_id: uuid.UUID,
@@ -250,6 +278,41 @@ async def create_payment_intent(
     }
 
 
+@router.post("/assessments/{assessment_id}/zero-rated-settlement", status_code=201)
+async def settle_zero_rated(
+    assessment_id: uuid.UUID,
+    request: Request,
+    session: SessionDep,
+    identity: IdentityDep,
+) -> dict[str, Any]:
+    """Zero-rated settlement: no rail receipt; policy-gated and audited."""
+    require_policy(request, identity, "payment", "create", "FIDUCIARY_SEGREGATED")
+    assessment = (
+        await session.execute(select(Assessment).where(Assessment.id == assessment_id))
+    ).scalar_one_or_none()
+    if assessment is None:
+        raise HTTPException(status_code=404, detail={"reason": "assessment-not-found"})
+    try:
+        intent = await payments.settle_zero_rated(
+            session, assessment=assessment, principal_sub=identity.subject
+        )
+    except PaymentError as exc:
+        raise HTTPException(status_code=422, detail={"reason": exc.reason, "detail": str(exc)}) from exc
+    await audit.record(session, "payment.zero-rated-settled", {
+        "paymentIntentId": str(intent.id),
+        "assessmentId": str(assessment_id),
+        "principal": identity.subject,
+    })
+    await session.commit()
+    return {
+        "paymentIntentId": str(intent.id),
+        "rail": intent.rail,
+        "expectedAmountKobo": intent.expected_amount_kobo,
+        "currency": intent.currency,
+        "status": intent.status,
+    }
+
+
 @router.post("/payments/receipts", status_code=201)
 async def record_payment_receipt(
     body: schemas.ReceiptIn,
@@ -257,8 +320,17 @@ async def record_payment_receipt(
     session: SessionDep,
     identity: IdentityDep,
 ) -> dict[str, Any]:
-    """Rail callback boundary (financial-controls reports the remittance)."""
+    """Rail callback boundary (financial-controls reports the remittance).
+
+    Strictly limited to the machine ``finance-rail-callback`` role — the PBAC
+    policy check stays, but this boundary additionally refuses any token
+    without the callback role outright."""
     require_policy(request, identity, "payment", "settle", "FIDUCIARY_SEGREGATED")
+    if "finance-rail-callback" not in identity.roles:
+        raise HTTPException(
+            status_code=403,
+            detail={"reason": "role-required", "role": "finance-rail-callback"},
+        )
     intent = (
         await session.execute(
             select(PaymentIntent).where(PaymentIntent.id == uuid.UUID(body.payment_intent_id))
@@ -279,9 +351,84 @@ async def record_payment_receipt(
         "amountKobo": receipt.amount_kobo,
         "quarantineReason": receipt.quarantine_reason,
     })
+    if receipt.status == "APPLIED":
+        # Mirror the settlement to financial-controls BEFORE committing: a
+        # rail failure rolls the receipt back (503 transient / 422 terminal),
+        # so an APPLIED receipt never exists without its rail mirror.
+        settings: Settings = request.app.state.settings
+        from taxstamps.services.payment_rail import (
+            PaymentRailClient,
+            RailRejectedError,
+            RailUnavailableError,
+        )
+
+        try:
+            rail_client = PaymentRailClient(settings, request.app.state.signing_key)
+            try:
+                await rail_client.forward_receipt(receipt)
+            finally:
+                await rail_client.close()
+        except RailUnavailableError as exc:
+            raise HTTPException(
+                status_code=503, detail={"reason": "rail-unavailable", "detail": str(exc)}
+            ) from exc
+        except RailRejectedError as exc:
+            raise HTTPException(
+                status_code=422, detail={"reason": "rail-rejected", "detail": str(exc)}
+            ) from exc
     await session.commit()
     return {
         "receiptId": str(receipt.id),
         "status": receipt.status,
         "quarantineReason": receipt.quarantine_reason,
+    }
+
+
+@router.post("/payments/intents/{intent_id}/quarantine-resolution", status_code=201)
+async def resolve_quarantine(
+    intent_id: uuid.UUID,
+    body: schemas.QuarantineResolutionIn,
+    request: Request,
+    session: SessionDep,
+    identity: IdentityDep,
+) -> dict[str, Any]:
+    """Controlled quarantine resolution (finance role): a SUPERSEDING receipt
+    settles the intent or marks it FAILED; the original receipt is untouched."""
+    require_policy(request, identity, "payment", "resolve", "FIDUCIARY_SEGREGATED")
+    intent = (
+        await session.execute(
+            select(PaymentIntent).where(PaymentIntent.id == intent_id)
+        )
+    ).scalar_one_or_none()
+    if intent is None:
+        raise HTTPException(status_code=404, detail={"reason": "intent-not-found"})
+    try:
+        receipt = await payments.resolve_quarantine(
+            session,
+            intent=intent,
+            resolution=body.resolution,
+            external_reference=body.external_reference,
+            supersedes_reference=body.supersedes_reference,
+            amount_kobo=body.amount_kobo,
+            currency=body.currency,
+            reason=body.reason,
+            principal_sub=identity.subject,
+        )
+    except PaymentError as exc:
+        status = 404 if exc.reason == "no-quarantine" else 422
+        raise HTTPException(status_code=status, detail={"reason": exc.reason, "detail": str(exc)}) from exc
+    await audit.record(session, "payment.quarantine-resolved", {
+        "paymentIntentId": str(intent_id),
+        "resolution": body.resolution,
+        "externalReference": receipt.external_reference,
+        "supersedesReference": body.supersedes_reference,
+        "reason": body.reason,
+        "principal": identity.subject,
+    })
+    await session.commit()
+    return {
+        "receiptId": str(receipt.id),
+        "status": receipt.status,
+        "intentStatus": intent.status,
+        "supersedesReference": receipt.supersedes_reference,
     }

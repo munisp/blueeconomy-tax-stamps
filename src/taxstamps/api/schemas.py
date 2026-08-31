@@ -47,6 +47,12 @@ class DecisionIn(BaseModel):
     reason: str = ""
 
 
+class CancelIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=3, max_length=512)
+
+
 class ReceiptIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -54,6 +60,17 @@ class ReceiptIn(BaseModel):
     external_reference: str = Field(min_length=4, max_length=128)
     amount_kobo: int = Field(ge=0)
     currency: str = Field(min_length=3, max_length=3)
+
+
+class QuarantineResolutionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resolution: Literal["SETTLE", "FAIL"]
+    external_reference: str = Field(min_length=4, max_length=128)  # new superseding receipt ref
+    supersedes_reference: str = Field(min_length=4, max_length=128)  # the QUARANTINED receipt
+    amount_kobo: int = Field(ge=0)
+    currency: str = Field(min_length=3, max_length=3)
+    reason: str = Field(min_length=3, max_length=512)
 
 
 class InspectionIn(BaseModel):

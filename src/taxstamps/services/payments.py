@@ -27,6 +27,12 @@ from taxstamps.models import (
     utcnow,
 )
 from taxstamps.services.journal import post_journal
+from taxstamps.telemetry import get_tracer
+
+# Phase-7 OTel: manual spans on the settlement path. No-op tracer unless
+# OTEL_EXPORTER_OTLP_ENDPOINT is set; attributes stay low-cardinality
+# (rail/status/resolution — never account, assessment or reference ids).
+_tracer = get_tracer("taxstamps.settlement")
 
 
 class PaymentError(ValueError):
@@ -48,6 +54,11 @@ async def create_intent(
         )
     if assessment.status != "APPROVED":
         raise PaymentError("invalid-state", f"assessment is {assessment.status}, expected APPROVED")
+    if assessment.zero_rated or assessment.total_duty_kobo == 0:
+        raise PaymentError(
+            "zero-rated",
+            "zero-rated assessments settle via the zero-rated path, not a payment rail",
+        )
     existing = (
         await session.execute(
             select(PaymentIntent).where(PaymentIntent.assessment_id == assessment.id)
@@ -68,6 +79,70 @@ async def create_intent(
     return intent
 
 
+async def settle_zero_rated(
+    session: AsyncSession,
+    *,
+    assessment: Assessment,
+    principal_sub: str,
+) -> PaymentIntent:
+    """Settle a zero-rated assessment without a rail receipt.
+
+    Zero-rated goods (e.g. pharmaceuticals) carry no federal excise but still
+    require traceability stamps; they must not dead-end on a rail payment of
+    zero. This path is policy-gated at the API layer (payment:create,
+    FIDUCIARY_SEGREGATED) and audited there; here it creates a settled
+    zero-amount intent (rail ``zero-rated``) as the durable settlement record
+    and transitions the assessment to PAID. No journal is posted — no funds
+    move. Idempotent.
+    """
+    if not assessment.zero_rated or assessment.total_duty_kobo != 0:
+        raise PaymentError(
+            "not-zero-rated",
+            "assessment is not zero-rated; settlement requires a rail receipt",
+        )
+    if assessment.status != "APPROVED":
+        raise PaymentError("invalid-state", f"assessment is {assessment.status}, expected APPROVED")
+    with _tracer.start_as_current_span("taxstamps.settlement.zero_rated") as span:
+        span.set_attribute("settlement.rail", "zero-rated")
+        existing = (
+            await session.execute(
+                select(PaymentIntent).where(PaymentIntent.assessment_id == assessment.id)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            span.set_attribute("settlement.outcome", "idempotent-replay")
+            return existing
+        intent = await _settle_zero_rated(session, assessment=assessment)
+        span.set_attribute("settlement.outcome", "settled")
+        return intent
+
+
+async def _settle_zero_rated(
+    session: AsyncSession,
+    *,
+    assessment: Assessment,
+) -> PaymentIntent:
+    locked = (
+        await session.execute(
+            select(Assessment).where(Assessment.id == assessment.id).with_for_update()
+        )
+    ).scalar_one()
+    intent = PaymentIntent(
+        id=uuid.uuid4(),
+        assessment_id=locked.id,
+        rail="zero-rated",
+        expected_amount_kobo=0,
+        currency=locked.currency,
+        status="SETTLED",
+        zero_rated=True,
+        settled_at=utcnow(),
+    )
+    locked.status = "PAID"
+    session.add(intent)
+    await session.flush()
+    return intent
+
+
 async def record_receipt(
     session: AsyncSession,
     *,
@@ -82,6 +157,27 @@ async def record_receipt(
     receipt row is returned); a conflicting amount under a replayed reference
     cannot occur because the reference is unique and receipts are immutable.
     """
+    with _tracer.start_as_current_span("taxstamps.settlement.receipt") as span:
+        span.set_attribute("settlement.rail", intent.rail)
+        receipt = await _record_receipt(
+            session,
+            intent=intent,
+            external_reference=external_reference,
+            amount_kobo=amount_kobo,
+            currency=currency,
+        )
+        span.set_attribute("settlement.receipt_status", receipt.status)
+        return receipt
+
+
+async def _record_receipt(
+    session: AsyncSession,
+    *,
+    intent: PaymentIntent,
+    external_reference: str,
+    amount_kobo: int,
+    currency: str,
+) -> PaymentReceipt:
     existing = (
         await session.execute(
             select(PaymentReceipt).where(PaymentReceipt.external_reference == external_reference)
@@ -146,6 +242,146 @@ async def record_receipt(
         session,
         reference=f"excise-settlement:{external_reference}",
         narration=f"Excise duty settlement for assessment {assessment.id}",
+        legs=[
+            ("assets:financial-controls-clearing", amount_kobo, 0),
+            ("revenue:excise-duty-payable", 0, amount_kobo),
+        ],
+    )
+    await session.flush()
+    return receipt
+
+
+async def resolve_quarantine(
+    session: AsyncSession,
+    *,
+    intent: PaymentIntent,
+    resolution: str,  # SETTLE | FAIL
+    external_reference: str,
+    supersedes_reference: str,
+    amount_kobo: int,
+    currency: str,
+    reason: str,
+    principal_sub: str,
+) -> PaymentReceipt:
+    """Controlled resolution of a quarantined remittance.
+
+    Posts a SUPERSEDING receipt (a NEW row — receipts stay immutable) that
+    either:
+    - SETTLE: applies the corrected remittance (exact amount + currency match
+      still REQUIRED) — the intent settles, the assessment goes PAID and the
+      balanced settlement journal is posted; or
+    - FAIL: records the quarantine evidence superseded and marks the intent
+      FAILED with the reason (the funds are never applied).
+
+    ``supersedes_reference`` MUST name an existing QUARANTINED receipt, so a
+    resolution can never be fabricated without quarantine evidence. Audited
+    at the API layer. Idempotent on the superseding ``external_reference``.
+    """
+    if resolution not in ("SETTLE", "FAIL"):
+        raise PaymentError("invalid-resolution", resolution)
+    if not reason or not reason.strip():
+        raise PaymentError("reason-required", "quarantine resolution requires a reason")
+    with _tracer.start_as_current_span("taxstamps.settlement.quarantine_resolution") as span:
+        span.set_attribute("settlement.resolution", resolution)
+        receipt = await _resolve_quarantine(
+            session,
+            intent=intent,
+            resolution=resolution,
+            external_reference=external_reference,
+            supersedes_reference=supersedes_reference,
+            amount_kobo=amount_kobo,
+            currency=currency,
+            reason=reason,
+        )
+        span.set_attribute("settlement.receipt_status", receipt.status)
+        return receipt
+
+
+async def _resolve_quarantine(
+    session: AsyncSession,
+    *,
+    intent: PaymentIntent,
+    resolution: str,
+    external_reference: str,
+    supersedes_reference: str,
+    amount_kobo: int,
+    currency: str,
+    reason: str,
+) -> PaymentReceipt:
+    existing = (
+        await session.execute(
+            select(PaymentReceipt).where(PaymentReceipt.external_reference == external_reference)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+    quarantined = (
+        await session.execute(
+            select(PaymentReceipt).where(
+                PaymentReceipt.external_reference == supersedes_reference,
+                PaymentReceipt.status == "QUARANTINED",
+            )
+        )
+    ).scalar_one_or_none()
+    if quarantined is None:
+        raise PaymentError(
+            "no-quarantine",
+            f"no quarantined receipt with reference {supersedes_reference}",
+        )
+    locked = (
+        await session.execute(
+            select(PaymentIntent).where(PaymentIntent.id == intent.id).with_for_update()
+        )
+    ).scalar_one()
+    if locked.status != "PENDING":
+        raise PaymentError("invalid-state", f"intent is {locked.status}, expected PENDING")
+    if resolution == "FAIL":
+        receipt = PaymentReceipt(
+            id=uuid.uuid4(),
+            payment_intent_id=None,
+            external_reference=external_reference,
+            amount_kobo=amount_kobo,
+            currency=currency,
+            status="QUARANTINED",
+            quarantine_reason=(
+                f"supersedes {supersedes_reference}: intent FAILED by resolution — {reason}"
+            ),
+            supersedes_reference=supersedes_reference,
+        )
+        locked.status = "FAILED"
+        session.add(receipt)
+        await session.flush()
+        return receipt
+    # SETTLE: the corrected remittance must still match exactly.
+    if amount_kobo != locked.expected_amount_kobo or currency != locked.currency:
+        raise PaymentError(
+            "amount-mismatch",
+            f"expected {locked.expected_amount_kobo} {locked.currency}, "
+            f"received {amount_kobo} {currency}",
+        )
+    receipt = PaymentReceipt(
+        id=uuid.uuid4(),
+        payment_intent_id=locked.id,
+        external_reference=external_reference,
+        amount_kobo=amount_kobo,
+        currency=currency,
+        status="APPLIED",
+        supersedes_reference=supersedes_reference,
+    )
+    session.add(receipt)
+    locked.status = "SETTLED"
+    locked.settled_at = utcnow()
+    assessment = (
+        await session.execute(select(Assessment).where(Assessment.id == locked.assessment_id))
+    ).scalar_one()
+    assessment.status = "PAID"
+    await post_journal(
+        session,
+        reference=f"excise-settlement:{external_reference}",
+        narration=(
+            f"Excise duty settlement for assessment {assessment.id} "
+            f"(quarantine resolution of {supersedes_reference})"
+        ),
         legs=[
             ("assets:financial-controls-clearing", amount_kobo, 0),
             ("revenue:excise-duty-payable", 0, amount_kobo),

@@ -140,18 +140,26 @@ def build_stamp_credential(
     issuer_did: str,
     serial: str,
     hs_code: str,
-    declaration_ref: str,
-    consignee_tin: str,
-    duty_paid_kobo: int,
+    batch_id: str,
+    assessment_ref: str,
     valid_from: str,
     valid_until: str,
     status_entries: list[dict[str, Any]],
+    stamp_scope: str = "unit",
 ) -> dict[str, Any]:
     """The stamp credential (unsigned; proof attached by issue_proof).
 
-    credentialSubject carries exactly the fields named in the platform
-    integration design: serial, HS code, declaration reference, consignee
-    TIN, duty paid, validity window.
+    UNIT-SCOPED ONLY: a single stamp is presented publicly (QR payload) and
+    must not disclose consignment-level financial data. credentialSubject
+    therefore carries exactly the unit-scoped fields — the unit serial, the
+    batch id, the HS code, the validity window and an ``assessmentRef``
+    (assessment identifier) through which consignment-level duty remains
+    resolvable by AUTHORIZED verifiers only (policy-gated read path). The
+    consignment duty amount, declaration reference and consignee TIN are
+    deliberately NOT embedded in the public credential.
+
+    ``stampScope`` ("unit" | "consignment") distinguishes the scope of the
+    credential; issuance always emits unit-scoped credentials.
     """
     return {
         "@context": list(VC_CONTEXT),
@@ -162,11 +170,11 @@ def build_stamp_credential(
         "validUntil": valid_until,
         "credentialSubject": {
             "id": f"{credential_id}#stamp",
+            "stampScope": stamp_scope,
             "serial": serial,
             "hsCode": hs_code,
-            "declarationRef": declaration_ref,
-            "consigneeTin": consignee_tin,
-            "dutyPaidKobo": duty_paid_kobo,
+            "batchId": batch_id,
+            "assessmentRef": assessment_ref,
         },
         "credentialStatus": status_entries,
     }

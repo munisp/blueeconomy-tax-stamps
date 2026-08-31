@@ -1,5 +1,13 @@
-"""Ops routes: probes, capabilities honesty registry, audit-chain verify,
-issuer key and status-list publication."""
+"""Ops routes.
+
+PUBLIC (probes and verifier-facing publications): liveness/readiness probes,
+issuer key and status-list credentials — these are deliberately anonymous.
+INTERNAL (`ops_router`): the capabilities honesty registry and the audit-chain
+verifier leak DB/Kafka internals and audit integrity state, so they are
+policy-gated behind require_policy("ops", "read") (auditor role) — anonymous
+callers get 401 (or 503 when OIDC is unconfigured: fail-closed), authenticated
+non-auditors get 403.
+"""
 
 from __future__ import annotations
 
@@ -8,11 +16,12 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import text
 
-from taxstamps.api.deps import SessionDep, SettingsDep
+from taxstamps.api.deps import IdentityDep, SessionDep, SettingsDep, require_policy
 from taxstamps.crypto.statuslist import PURPOSES
 from taxstamps.services import audit, capabilities, redis_guard, statuslists
 
 router = APIRouter()
+ops_router = APIRouter()
 
 
 @router.get("/healthz")
@@ -26,8 +35,11 @@ async def readyz(session: SessionDep) -> dict[str, str]:
     return {"status": "ready"}
 
 
-@router.get("/v1/capabilities")
-async def v1_capabilities(request: Request, settings: SettingsDep, session: SessionDep) -> dict[str, Any]:
+@ops_router.get("/v1/capabilities")
+async def v1_capabilities(
+    request: Request, settings: SettingsDep, session: SessionDep, identity: IdentityDep
+) -> dict[str, Any]:
+    require_policy(request, identity, "ops", "read", "INTERNAL")
     runtime: dict[str, bool | str] = {}
     try:
         await session.execute(text("SELECT 1"))
@@ -47,8 +59,11 @@ async def v1_capabilities(request: Request, settings: SettingsDep, session: Sess
     return capabilities.capability_report(settings, runtime)
 
 
-@router.get("/v1/ops/audit-chain")
-async def audit_chain_verify(session: SessionDep) -> dict[str, Any]:
+@ops_router.get("/v1/ops/audit-chain")
+async def audit_chain_verify(
+    request: Request, session: SessionDep, identity: IdentityDep
+) -> dict[str, Any]:
+    require_policy(request, identity, "ops", "read", "INTERNAL")
     result = await audit.verify_chain(session)
     return {
         "ok": result.ok,

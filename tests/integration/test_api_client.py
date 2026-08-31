@@ -47,13 +47,16 @@ def test_healthz_readyz(client):
     assert client.get("/readyz").status_code == 200
 
 
-def test_capabilities_honesty(client):
-    report = client.get("/v1/capabilities").json()
+def test_capabilities_honesty(oidc_client):
+    """TS-7: capabilities are auditor-gated; the honesty content is unchanged."""
+    client, mint = oidc_client
+    token = mint("auditor-1", ["auditor"])
+    report = client.get("/v1/capabilities", headers={"Authorization": f"Bearer {token}"}).json()
     caps = {c["capability"]: c for c in report["capabilities"]}
     assert caps["database"]["available"] is True
     assert caps["signing.eddsa-jcs-2022"]["available"] is True
     # unconfigured integrations: unavailable WITH reason, never fabricated
-    assert caps["auth.oidc"]["available"] is False and caps["auth.oidc"]["reason"]
+    assert caps["auth.oidc"]["available"] is True  # configured for this fixture
     assert caps["payments.rail"]["available"] is False and caps["payments.rail"]["reason"]
     assert caps["kafka.outbox-publisher"]["available"] is False
     assert caps["printer.hardware-integration"]["available"] is False
@@ -104,7 +107,30 @@ def test_status_list_404_until_published(client):
     assert client.get("/v1/status-list/bogus").status_code == 404
 
 
-def test_audit_chain_endpoint(client):
-    resp = client.get("/v1/ops/audit-chain")
+def test_audit_chain_endpoint(oidc_client):
+    client, mint = oidc_client
+    token = mint("auditor-1", ["auditor"])
+    resp = client.get("/v1/ops/audit-chain", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
     assert resp.json()["ok"] is True
+
+
+def test_ops_endpoints_fail_closed_without_oidc(client):
+    """TS-7: ops endpoints are never anonymous; with OIDC unconfigured the
+    fail-closed answer is 503 (same as every other authenticated route)."""
+    assert client.get("/v1/ops/audit-chain").status_code == 503
+    assert client.get("/v1/capabilities").status_code == 503
+    # probes and verifier-facing publications stay public
+    assert client.get("/healthz").status_code == 200
+    assert client.get("/readyz").status_code == 200
+
+
+def test_ops_endpoints_pbac(oidc_client):
+    """TS-7 regression: anonymous -> 401, non-auditor -> 403, auditor -> 200."""
+    client, mint = oidc_client
+    for path in ("/v1/ops/audit-chain", "/v1/capabilities"):
+        assert client.get(path).status_code == 401
+        officer = mint("officer-1", ["excise-officer"])
+        assert client.get(path, headers={"Authorization": f"Bearer {officer}"}).status_code == 403
+        auditor = mint("auditor-1", ["auditor"])
+        assert client.get(path, headers={"Authorization": f"Bearer {auditor}"}).status_code == 200

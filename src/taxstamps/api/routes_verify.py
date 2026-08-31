@@ -1,12 +1,20 @@
 """Verification endpoints.
 
-POST /v1/verify        — authenticated field verification: per-verifier
-                         credential (no shared fleet secret), Redis single-use
-                         nonce + rate limit (fail-closed on Redis outage).
-POST /v1/verify/public — importer/consumer self-service: no device credential;
-                         performs the stamp consumption scan plus, when a full
-                         credential is presented, offline signature + status-list
-                         checks.
+POST /v1/verify        — authenticated field verification (CONSUMING):
+                         per-verifier credential (no shared fleet secret),
+                         Redis single-use nonce + rate limit (fail-closed on
+                         Redis outage). First-scan-wins clone detection
+                         (ACTIVE -> CONSUMED) applies ONLY here.
+POST /v1/verify/public — importer/consumer self-service (NON-CONSUMING):
+                         no device credential; returns validity/outcome and
+                         status-list state but never transitions
+                         ACTIVE -> CONSUMED (public serials are enumerable,
+                         so a consuming public path would enable mass
+                         stamp-burning). Anomaly throttling: per-IP plus a
+                         per-serial scan-rate cap when Redis is present;
+                         when a full credential is presented it additionally
+                         performs the offline checks (signature + status-list
+                         bits).
 """
 
 from __future__ import annotations
@@ -90,13 +98,25 @@ async def verify_public(
     session: SessionDep,
     settings: SettingsDep,
 ) -> dict[str, Any]:
-    """Self-service verification: no device credential. Rate-limited by client
-    address when Redis is configured; when Redis is configured-but-down the
-    endpoint is fail-closed like the authenticated one."""
+    """Self-service verification: no device credential, NON-CONSUMING.
+    Rate-limited per client address AND per presented serial when Redis is
+    configured; when Redis is configured-but-down the endpoint is fail-closed
+    like the authenticated one."""
+    serial = body.serial
+    if body.credential is not None:
+        subject = body.credential.get("credentialSubject", {})
+        serial = serial or subject.get("serial")
     if settings.redis_configured:
         try:
             client_ip = request.client.host if request.client else "unknown"
             await redis_guard.rate_limit(f"verify-public:{client_ip}", settings.rate_limit_per_minute)
+            if serial:
+                # Per-serial anomaly throttle: caps mass-scanning of one stamp
+                # from rotating source addresses.
+                await redis_guard.rate_limit(
+                    f"verify-public-serial:{serial.strip().upper()}",
+                    settings.public_serial_rate_limit_per_minute,
+                )
         except RedisUnavailable as exc:
             raise HTTPException(
                 status_code=503,
@@ -106,10 +126,7 @@ async def verify_public(
         except ValueError as exc:
             raise HTTPException(status_code=429, detail={"reason": "rate-limit", "detail": str(exc)}) from exc
     response: dict[str, Any] = {}
-    serial = body.serial
     if body.credential is not None:
-        subject = body.credential.get("credentialSubject", {})
-        serial = serial or subject.get("serial")
         # Offline checks: proof signature + status-list bits.
         status_lists: dict[str, StatusList] = {}
         for purpose in PURPOSES:
