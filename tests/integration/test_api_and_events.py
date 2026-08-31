@@ -35,7 +35,7 @@ def _declaration_envelope(event_id: str):
 async def test_consumer_applies_verified_envelope(session, signing_key):
     directory = KeyDirectory({signing_key.kid: signing_key.public_key})
     envelope = sign_envelope(_declaration_envelope("evt-k-1"), signing_key)
-    disposition = await apply_declaration_envelope(envelope, directory, db_session=session)
+    disposition = await apply_declaration_envelope(envelope, directory, db_session=session, trusted_kid_prefixes=())
     await session.commit()
     assert disposition == "applied"
     decl = (await session.execute(
@@ -51,9 +51,9 @@ async def test_consumer_applies_verified_envelope(session, signing_key):
 async def test_consumer_dedupes_replay(session, signing_key):
     directory = KeyDirectory({signing_key.kid: signing_key.public_key})
     envelope = sign_envelope(_declaration_envelope("evt-k-2"), signing_key)
-    assert await apply_declaration_envelope(envelope, directory, db_session=session) == "applied"
+    assert await apply_declaration_envelope(envelope, directory, db_session=session, trusted_kid_prefixes=()) == "applied"
     await session.commit()
-    assert await apply_declaration_envelope(envelope, directory, db_session=session) == "duplicate"
+    assert await apply_declaration_envelope(envelope, directory, db_session=session, trusted_kid_prefixes=()) == "duplicate"
     await session.commit()
     count = (await session.execute(select(func.count()).select_from(ProcessedEvent))).scalar_one()
     assert count == 1
@@ -66,7 +66,7 @@ async def test_consumer_rejects_forged_envelope(session, signing_key):
     from taxstamps.events.envelope import EnvelopeError
 
     with pytest.raises(EnvelopeError):
-        await apply_declaration_envelope(envelope, directory, db_session=session)
+        await apply_declaration_envelope(envelope, directory, db_session=session, trusted_kid_prefixes=())
     # rejected envelopes are never persisted
     count = (await session.execute(select(func.count()).select_from(Declaration))).scalar_one()
     assert count == 0
@@ -79,7 +79,7 @@ async def test_consumer_rejects_tampered_payload(session, signing_key):
     from taxstamps.events.envelope import EnvelopeError
 
     with pytest.raises(EnvelopeError) as exc:
-        await apply_declaration_envelope(envelope, directory, db_session=session)
+        await apply_declaration_envelope(envelope, directory, db_session=session, trusted_kid_prefixes=())
     assert exc.value.reason == "payload-mismatch"
 
 
