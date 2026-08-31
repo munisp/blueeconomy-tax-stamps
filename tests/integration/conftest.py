@@ -241,6 +241,7 @@ async def make_paid_assessment(
     rail_settings = settings.model_copy(update={
         "payment_rail": "cvff-tigerbeetle",
         "financial_controls_endpoint": "https://financial-controls.example",
+        "financial_controls_token": "test-fc-token",
     })
     intent = await create_intent(session, settings=rail_settings, assessment=assessment)
     receipt = await record_receipt(

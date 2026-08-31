@@ -99,6 +99,7 @@ async def test_cancelled_assessment_blocks_issuance(session, settings):
     rail = settings.model_copy(update={
         "payment_rail": "cvff-tigerbeetle",
         "financial_controls_endpoint": "https://financial-controls.example",
+        "financial_controls_token": "test-fc-token",
     })
     with pytest.raises(PaymentError, match="invalid-state"):
         await create_intent(session, settings=rail, assessment=cancelled)

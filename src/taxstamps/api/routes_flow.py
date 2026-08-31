@@ -19,6 +19,7 @@ from taxstamps.api.deps import (
     require_policy,
     store_idempotency,
 )
+from taxstamps.config import Settings
 from taxstamps.crypto.eddsa import SigningKey
 from taxstamps.models import (
     Assessment,
@@ -319,8 +320,17 @@ async def record_payment_receipt(
     session: SessionDep,
     identity: IdentityDep,
 ) -> dict[str, Any]:
-    """Rail callback boundary (financial-controls reports the remittance)."""
+    """Rail callback boundary (financial-controls reports the remittance).
+
+    Strictly limited to the machine ``finance-rail-callback`` role — the PBAC
+    policy check stays, but this boundary additionally refuses any token
+    without the callback role outright."""
     require_policy(request, identity, "payment", "settle", "FIDUCIARY_SEGREGATED")
+    if "finance-rail-callback" not in identity.roles:
+        raise HTTPException(
+            status_code=403,
+            detail={"reason": "role-required", "role": "finance-rail-callback"},
+        )
     intent = (
         await session.execute(
             select(PaymentIntent).where(PaymentIntent.id == uuid.UUID(body.payment_intent_id))
@@ -341,6 +351,31 @@ async def record_payment_receipt(
         "amountKobo": receipt.amount_kobo,
         "quarantineReason": receipt.quarantine_reason,
     })
+    if receipt.status == "APPLIED":
+        # Mirror the settlement to financial-controls BEFORE committing: a
+        # rail failure rolls the receipt back (503 transient / 422 terminal),
+        # so an APPLIED receipt never exists without its rail mirror.
+        settings: Settings = request.app.state.settings
+        from taxstamps.services.payment_rail import (
+            PaymentRailClient,
+            RailRejectedError,
+            RailUnavailableError,
+        )
+
+        try:
+            rail_client = PaymentRailClient(settings, request.app.state.signing_key)
+            try:
+                await rail_client.forward_receipt(receipt)
+            finally:
+                await rail_client.close()
+        except RailUnavailableError as exc:
+            raise HTTPException(
+                status_code=503, detail={"reason": "rail-unavailable", "detail": str(exc)}
+            ) from exc
+        except RailRejectedError as exc:
+            raise HTTPException(
+                status_code=422, detail={"reason": "rail-rejected", "detail": str(exc)}
+            ) from exc
     await session.commit()
     return {
         "receiptId": str(receipt.id),

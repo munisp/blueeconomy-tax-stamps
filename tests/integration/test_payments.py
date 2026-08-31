@@ -28,6 +28,7 @@ def _rail_settings(settings):
     return settings.model_copy(update={
         "payment_rail": "cvff-tigerbeetle",
         "financial_controls_endpoint": "https://financial-controls.example",
+        "financial_controls_token": "test-fc-token",
     })
 
 
