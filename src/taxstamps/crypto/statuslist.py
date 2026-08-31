@@ -30,7 +30,7 @@ __all__ = [
     "parse_status_list_credential",
 ]
 
-DEFAULT_LIST_SIZE_BITS = 131072  # 16 KiB minimum per W3C Bitstring Status List
+DEFAULT_LIST_SIZE_BITS = 1048576  # 128 KiB: fleet conformance size for high-volume stamp lists
 PURPOSES = ("void", "expired", "suspect")
 
 

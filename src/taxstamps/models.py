@@ -120,12 +120,14 @@ class Assessment(Base):
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     idempotency_key: Mapped[str] = mapped_column(String(128), unique=True)
+    zero_rated: Mapped[bool] = mapped_column(Boolean, default=False)  # e.g. pharmaceuticals
     __table_args__ = (
         CheckConstraint(f"status IN {ASSESSMENT_STATUSES!r}", name="ck_assessment_status"),
         CheckConstraint("total_duty_kobo >= 0", name="ck_assessment_total"),
         CheckConstraint("stamps_required >= 0", name="ck_assessment_stamps"),
         CheckConstraint("approvals_required BETWEEN 1 AND 3", name="ck_assessment_approvals"),
         CheckConstraint("risk_tier IN ('LOW','STANDARD','HIGH')", name="ck_assessment_risk"),
+        CheckConstraint("total_duty_kobo > 0 OR zero_rated", name="ck_assessment_zero_rated"),
     )
 
 
@@ -179,11 +181,13 @@ class PaymentIntent(Base):
     expected_amount_kobo: Mapped[int] = mapped_column(BigInteger)
     currency: Mapped[str] = mapped_column(String(3), default="NGN")
     status: Mapped[str] = mapped_column(String(16), default="PENDING")  # PENDING|SETTLED|FAILED
+    zero_rated: Mapped[bool] = mapped_column(Boolean, default=False)  # zero-rated settle path
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         CheckConstraint("status IN ('PENDING','SETTLED','FAILED')", name="ck_intent_status"),
-        CheckConstraint("expected_amount_kobo > 0", name="ck_intent_amount"),
+        CheckConstraint("expected_amount_kobo >= 0", name="ck_intent_amount"),
+        CheckConstraint("expected_amount_kobo > 0 OR zero_rated", name="ck_intent_zero_rated"),
     )
 
 
@@ -200,6 +204,9 @@ class PaymentReceipt(Base):
     currency: Mapped[str] = mapped_column(String(3))
     status: Mapped[str] = mapped_column(String(16))  # APPLIED | QUARANTINED
     quarantine_reason: Mapped[str] = mapped_column(Text, default="")
+    # Quarantine resolution: a SUPERSEDING receipt references the quarantined
+    # receipt it resolves (the original stays immutable).
+    supersedes_reference: Mapped[str] = mapped_column(String(128), default="")
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     __table_args__ = (
         CheckConstraint("status IN ('APPLIED','QUARANTINED')", name="ck_receipt_status"),
@@ -302,6 +309,29 @@ class Stamp(Base):
         CheckConstraint(f"status IN {STAMP_STATUSES!r}", name="ck_stamp_status"),
         UniqueConstraint("category_code", "year", "sequence", name="uq_stamp_cat_year_seq"),
         Index("ix_stamps_first_scan", "first_scan_at"),
+    )
+
+
+VOID_REQUEST_STATUSES = ("PENDING", "EXECUTED", "REJECTED")
+
+
+class StampVoidRequest(Base):
+    """Maker-checker stamp void: the void requester can never be the void
+    approver (consistent with the assessment approvals pattern). The void
+    itself (status + status-list bit) executes only on approval."""
+
+    __tablename__ = "stamp_void_requests"
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    serial: Mapped[str] = mapped_column(String(32), index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    requested_by: Mapped[str] = mapped_column(String(256))
+    approved_by: Mapped[str] = mapped_column(String(256), default="")
+    status: Mapped[str] = mapped_column(String(16), default="PENDING")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        CheckConstraint(f"status IN {VOID_REQUEST_STATUSES!r}", name="ck_void_request_status"),
+        CheckConstraint("approved_by = '' OR approved_by <> requested_by", name="ck_void_request_not_self"),
     )
 
 

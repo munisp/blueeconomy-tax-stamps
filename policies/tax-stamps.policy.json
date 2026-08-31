@@ -29,6 +29,15 @@
       "classification": ["FIDUCIARY_SEGREGATED", "CONFIDENTIAL"]
     },
     {
+      "name": "finance-officer-resolves-quarantines",
+      "roles": ["finance-officer"],
+      "resource": "payment",
+      "action": "resolve",
+      "tenant": "*",
+      "clearance": ["*"],
+      "classification": ["FIDUCIARY_SEGREGATED"]
+    },
+    {
       "name": "rail-callback-records-receipts",
       "roles": ["finance-rail-callback"],
       "resource": "payment",
@@ -74,9 +83,18 @@
       "classification": ["CONFIDENTIAL"]
     },
     {
-      "name": "officers-read-stamps-and-batches",
+      "name": "officers-read-assessments",
       "roles": ["excise-officer", "excise-approver", "quality-inspector", "finance-officer", "auditor"],
-      "resource": "*",
+      "resource": "assessment",
+      "action": "read",
+      "tenant": "*",
+      "clearance": ["*"],
+      "classification": ["*"]
+    },
+    {
+      "name": "officers-read-stamps",
+      "roles": ["excise-officer", "excise-approver", "quality-inspector", "finance-officer", "auditor"],
+      "resource": "stamp",
       "action": "read",
       "tenant": "*",
       "clearance": ["*"],

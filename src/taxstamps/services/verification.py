@@ -1,11 +1,19 @@
 """Verification: first-scan-wins with clone-suspect analytics.
 
-- The first valid scan of an ACTIVE stamp CONSUMES it (ferry-boarding
-  pattern). The transition happens under SELECT ... FOR UPDATE so
-  concurrent first scans are serialized; exactly one wins.
-- Repeat scans return already_verified with first-scan evidence; a repeat
-  from a DIFFERENT device than the first scan returns clone_suspect and sets
-  the stamp's ``suspect`` bit in the status list.
+- CONSUMPTION requires verifier credentials: the first CREDENTIALLED scan of
+  an ACTIVE stamp CONSUMES it (ferry-boarding pattern). The transition
+  happens under SELECT ... FOR UPDATE so concurrent first scans are
+  serialized; exactly one wins.
+- PUBLIC scans (no device credential) are NON-CONSUMING: they return
+  validity/outcome and status-list state but NEVER transition
+  ACTIVE -> CONSUMED. Serials are enumerable per category/year, so a
+  consuming public path would let anyone mass-burn genuine active stamps.
+  Clone-detection (first-scan-wins) applies only to credentialed
+  consumption scans; the public path additionally carries a per-serial
+  scan-rate cap (beyond per-IP) when Redis is present.
+- Repeat credentialed scans return already_verified with first-scan
+  evidence; a repeat from a DIFFERENT device than the first scan returns
+  clone_suspect and sets the stamp's ``suspect`` bit in the status list.
 - Velocity: >= N distinct devices in the trailing window flags clone_suspect.
 - EVERY attempt (valid or not, public or authenticated) is persisted with
   device identity and integer micro-degree geo as audit substrate.
@@ -27,7 +35,7 @@ from taxstamps.config import Settings
 from taxstamps.crypto.eddsa import SigningKey
 from taxstamps.crypto.vc import VCError, verify_proof
 from taxstamps.domain.serials import SerialError, parse_serial
-from taxstamps.models import Stamp, Verification
+from taxstamps.models import Stamp, StampVoidRequest, Verification
 from taxstamps.services import outbox, statuslists
 
 
@@ -173,17 +181,31 @@ async def verify_stamp(
         )
         return _result("not_active", parts.serial, stamp, f"stamp is {stamp.status}")
 
-    # First scan wins: consume the stamp.
-    stamp.status = "CONSUMED"
-    stamp.first_scan_at = now
-    stamp.first_scan_verifier = verifier_id
-    stamp.first_scan_lat_micros = lat_micros
-    stamp.first_scan_long_micros = long_micros
+    # ACTIVE stamp: public scans are non-consuming; only a credentialed
+    # first scan consumes the stamp.
+    detail = "first scan"
+    if public_scan:
+        # Non-consuming public scan: report validity + status-list state but
+        # leave the stamp ACTIVE so importers' goods can never be mass-burned
+        # by an untrusted party enumerating serials.
+        detail = "public scan (non-consuming)"
+    else:
+        # First credentialed scan wins: consume the stamp.
+        stamp.status = "CONSUMED"
+        stamp.first_scan_at = now
+        stamp.first_scan_verifier = verifier_id
+        stamp.first_scan_lat_micros = lat_micros
+        stamp.first_scan_long_micros = long_micros
     await _record_attempt(
         session, serial_presented=parts.serial, stamp=stamp, verifier_id=verifier_id,
-        public_scan=public_scan, outcome="valid", detail="first scan",
+        public_scan=public_scan, outcome="valid", detail=detail,
         lat_micros=lat_micros, long_micros=long_micros,
     )
+    if not public_scan:
+        # A batch whose stamps are all in terminal states is closed out.
+        from taxstamps.services import issuance
+
+        await issuance.refresh_batch_terminal_state(session, batch_id=stamp.batch_id)
     velocity = await _velocity_suspect(session, stamp.id, settings)
     await outbox.enqueue(
         session,
@@ -203,45 +225,113 @@ async def verify_stamp(
         correlation_id=stamp.declaration_ref,
     )
     await session.flush()
-    return _result("valid", parts.serial, stamp, "first scan")
+    return _result("valid", parts.serial, stamp, detail)
 
 
-async def void_stamp(
+async def request_void(
     session: AsyncSession,
     *,
     serial: str,
     reason: str,
     principal_sub: str,
-    settings: Settings,
-    signing_key: SigningKey,
-) -> Stamp:
-    """Void a stamp (reason required): sets the ``void`` status-list bit."""
+) -> StampVoidRequest:
+    """Request a stamp void (maker step). The void executes only when a
+    DIFFERENT excise-approver approves it — same maker-checker bar as
+    assessments. Idempotent: one PENDING request per serial."""
     if not reason or not reason.strip():
         raise VerificationError("reason-required", "void requires a reason")
+    normalized = serial.strip().upper()
     stamp = (
-        await session.execute(
-            select(Stamp).where(Stamp.serial == serial.strip().upper()).with_for_update()
-        )
+        await session.execute(select(Stamp).where(Stamp.serial == normalized))
     ).scalars().first()
     if stamp is None:
         raise VerificationError("not-found", "unknown serial")
     if stamp.status == "VOID":
-        return stamp
-    stamp.status = "VOID"
-    await statuslists.set_flag(
-        session, purpose="void", index=stamp.status_list_index,
-        settings=settings, signing_key=signing_key,
-        verification_method=f"{settings.issuer_did}#ed25519-{signing_key.kid}",
+        raise VerificationError("already-void", f"stamp {normalized} is already VOID")
+    pending = (
+        await session.execute(
+            select(StampVoidRequest).where(
+                StampVoidRequest.serial == normalized, StampVoidRequest.status == "PENDING"
+            )
+        )
+    ).scalars().first()
+    if pending is not None:
+        return pending
+    request = StampVoidRequest(
+        id=uuid.uuid4(),
+        serial=normalized,
+        reason=reason,
+        requested_by=principal_sub,
     )
-    await outbox.enqueue(
-        session,
-        event_type="stamps.voided.v1",
-        resource={"serial": stamp.serial, "reason": reason, "batchId": str(stamp.batch_id)},
-        signing_key=signing_key,
-        principal_id=principal_sub,
-        principal_role="excise-approver",
-        correlation_id=stamp.declaration_ref,
-    )
+    session.add(request)
+    await session.flush()
+    return request
+
+
+async def approve_void(
+    session: AsyncSession,
+    *,
+    serial: str,
+    principal_sub: str,
+    settings: Settings,
+    signing_key: SigningKey,
+) -> Stamp:
+    """Approve a pending void request (checker step) and execute the void:
+    stamp status VOID + the ``void`` status-list bit + outbox event.
+
+    The requester can NEVER approve their own request (409 at the API layer),
+    consistent with the assessment maker-checker pattern.
+    """
+    normalized = serial.strip().upper()
+    request = (
+        await session.execute(
+            select(StampVoidRequest)
+            .where(StampVoidRequest.serial == normalized, StampVoidRequest.status == "PENDING")
+            .with_for_update()
+        )
+    ).scalars().first()
+    if request is None:
+        raise VerificationError("no-pending-request", f"no pending void request for {normalized}")
+    if request.requested_by == principal_sub:
+        raise VerificationError(
+            "self-approval", "the void requester cannot approve their own void request"
+        )
+    stamp = (
+        await session.execute(
+            select(Stamp).where(Stamp.serial == normalized).with_for_update()
+        )
+    ).scalars().first()
+    if stamp is None:
+        raise VerificationError("not-found", "unknown serial")
+    if stamp.status != "VOID":
+        stamp.status = "VOID"
+        await statuslists.set_flag(
+            session, purpose="void", index=stamp.status_list_index,
+            settings=settings, signing_key=signing_key,
+            verification_method=f"{settings.issuer_did}#ed25519-{signing_key.kid}",
+        )
+        await outbox.enqueue(
+            session,
+            event_type="stamps.voided.v1",
+            resource={
+                "serial": stamp.serial,
+                "reason": request.reason,
+                "batchId": str(stamp.batch_id),
+                "requestedBy": request.requested_by,
+                "approvedBy": principal_sub,
+            },
+            signing_key=signing_key,
+            principal_id=principal_sub,
+            principal_role="excise-approver",
+            correlation_id=stamp.declaration_ref,
+        )
+    request.status = "EXECUTED"
+    request.approved_by = principal_sub
+    request.decided_at = datetime.now(UTC)
+    # A batch whose stamps are now all in terminal states is closed out.
+    from taxstamps.services import issuance
+
+    await issuance.refresh_batch_terminal_state(session, batch_id=stamp.batch_id)
     await session.flush()
     return stamp
 
