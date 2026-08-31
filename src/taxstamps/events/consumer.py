@@ -18,11 +18,20 @@ FHIR Bundle's single entry resource:
    "lineItems": [{"hsCode": "...", "description": "...", "quantity": n,
                   "unit": "STICK|LITRE|UNIT", "customsValueKobo": n,
                   "stampsRequired": n}]}
+
+The real producer (blueeconomy-port-interoperability,
+internal/events/envelope.go Message + internal/declarations/model.go
+Declaration) wraps its payload differently: the entry resource is a FHIR
+Basic whose ``domain-payload`` extension carries the Declaration JSON as a
+string (snake_case fields, a single ``hs_code``).
+``normalize_declaration_resource`` maps that shape explicitly onto the
+canonical form; unrecognized shapes fail closed.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from typing import Any
@@ -48,6 +57,92 @@ def topic_pattern_regex(pattern: str) -> str:
     return "^" + pattern.replace(".", r"\.").replace("*", ".*") + "$"
 
 
+# Extension URL under which blueeconomy-port-interoperability carries the
+# domain payload inside its FHIR Basic entry resource
+# (internal/events/envelope.go Message).
+_DOMAIN_PAYLOAD_EXTENSION_URL = (
+    "https://blueeconomy.gov.ng/fhir/StructureDefinition/domain-payload"
+)
+
+
+def normalize_declaration_resource(resource: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the FHIR entry resource to the canonical declaration shape.
+
+    Accepted shapes:
+      1. Canonical (``declarationRef``/``consigneeTin``/``lineItems``
+         present) — returned unchanged.
+      2. blueeconomy-port-interoperability: a FHIR ``Basic`` resource whose
+         ``domain-payload`` extension ``valueString`` carries the
+         Declaration JSON (internal/declarations/model.go, snake_case,
+         single ``hs_code``). Mapped explicitly:
+           declaration_ref    -> declarationRef
+           consignee_id       -> consigneeTin (the consignee identifier)
+           hs_code            -> lineItems[0].hsCode
+           goods_description  -> lineItems[0].description
+           number_of_packages -> lineItems[0].quantity
+           unit               -> "UNIT" (the producer carries no excise unit)
+           invoice_amount_minor -> lineItems[0].customsValueKobo, only when
+                                 invoice_currency == "NGN" (mapping a foreign
+                                 minor unit to kobo would be fabrication)
+
+    Anything else, or a malformed/missing payload, fails closed with
+    ValueError — the envelope is rejected, never persisted.
+    """
+    if _REQUIRED_RESOURCE_FIELDS <= set(resource):
+        return resource
+    if resource.get("resourceType") != "Basic":
+        raise ValueError(
+            "declaration resource is neither canonical nor a port-interoperability FHIR Basic"
+        )
+    payload_raw: str | None = None
+    for extension in resource.get("extension") or []:
+        if isinstance(extension, dict) and extension.get("url") == _DOMAIN_PAYLOAD_EXTENSION_URL:
+            payload_raw = extension.get("valueString")
+            break
+    if not payload_raw:
+        raise ValueError("FHIR Basic resource carries no domain-payload extension")
+    try:
+        payload = json.loads(payload_raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"domain-payload extension is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("domain-payload extension must decode to a JSON object")
+    declaration_ref = str(payload.get("declaration_ref") or "").strip()
+    consignee_id = str(payload.get("consignee_id") or "").strip()
+    hs_code = str(payload.get("hs_code") or "").strip()
+    if not declaration_ref or not consignee_id or not hs_code:
+        raise ValueError(
+            "port-interoperability declaration payload missing "
+            "declaration_ref/consignee_id/hs_code"
+        )
+    try:
+        quantity = int(payload.get("number_of_packages") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("number_of_packages must be an integer") from exc
+    if quantity < 1:
+        quantity = 1
+    customs_value_kobo = 0
+    if str(payload.get("invoice_currency") or "").upper() == "NGN":
+        try:
+            customs_value_kobo = int(payload.get("invoice_amount_minor") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invoice_amount_minor must be an integer") from exc
+    return {
+        "declarationRef": declaration_ref,
+        "consigneeTin": consignee_id,
+        "consigneeName": "",
+        "lineItems": [
+            {
+                "hsCode": hs_code,
+                "description": str(payload.get("goods_description") or ""),
+                "quantity": quantity,
+                "unit": "UNIT",
+                "customsValueKobo": customs_value_kobo,
+            }
+        ],
+    }
+
+
 async def apply_declaration_envelope(
     envelope: dict[str, Any],
     directory: KeyDirectory,
@@ -58,7 +153,7 @@ async def apply_declaration_envelope(
 
     When ``db_session`` is supplied the caller owns the transaction/commit;
     otherwise a session is opened and committed here (consumer path)."""
-    resource = verify_envelope(envelope, directory)
+    resource = normalize_declaration_resource(verify_envelope(envelope, directory))
     missing = _REQUIRED_RESOURCE_FIELDS - set(resource)
     if missing:
         raise ValueError(f"declaration resource missing fields {sorted(missing)}")

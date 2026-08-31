@@ -137,7 +137,10 @@ topic; `*` wildcard supported), `TAXSTAMPS_OIDC_JWKS_URL` /
 
 One image, three entrypoints: `taxstamps-api` (HTTP),
 `taxstamps-consumer` (`trade.declarations.v1` Kafka consumer, envelope-verified,
-deduped on eventId, offset committed after DB commit), `taxstamps-outbox`
+deduped on eventId, offset committed after DB commit; maps the
+blueeconomy-port-interoperability FHIR Basic / `domain-payload` declaration
+payload onto the canonical resource shape — see
+`src/taxstamps/events/consumer.py`), `taxstamps-outbox`
 (outbox publisher). Migrations: `alembic upgrade head`
 (`TAXSTAMPS_DATABASE_URL` required).
 
