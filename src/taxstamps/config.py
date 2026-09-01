@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     # trade.declarations.v1, so it is part of the default set.
     kafka_declarations_topic_pattern: str = "declarations.*,trade.declarations.v1"
     kafka_consumer_group: str = "blueeconomy-tax-stamps"
+    # Producer batching (outbox publisher). Defaults preserve the previous
+    # fire-and-await behavior: linger 0 and the aiokafka default batch size.
+    kafka_linger_ms: int = 0            # >0 lets the producer coalesce messages
+    kafka_max_batch_size: int = 16384   # aiokafka/kafka default
     # Producer-contract normalization: eventType=mode comma pairs mapping
     # producer eventTypes (FHIR Basic domain-payload string extension) onto
     # the structural declaration resource. Fail-closed on unknown modes and

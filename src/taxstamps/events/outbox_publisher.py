@@ -59,6 +59,8 @@ async def publish_forever() -> None:
     producer = AIOKafkaProducer(
         bootstrap_servers=settings.kafka_bootstrap_servers,
         enable_idempotence=True,
+        linger_ms=settings.kafka_linger_ms,
+        max_batch_size=settings.kafka_max_batch_size,
     )
     await producer.start()
     log.info("outbox publisher started")
