@@ -1,0 +1,30 @@
+{
+  "database": "be_tax",
+  "exemptions": {},
+  "table_count": 21,
+  "tables": {
+    "approvals": 2,
+    "assessment_lines": 2,
+    "assessments": 2,
+    "audit_events": 2,
+    "declaration_lines": 2,
+    "declarations": 2,
+    "idempotency_records": 2,
+    "inspections": 2,
+    "journals": 2,
+    "ledger_entries": 2,
+    "outbox_messages": 2,
+    "payment_intents": 2,
+    "payment_receipts": 2,
+    "principals": 2,
+    "processed_events": 2,
+    "serial_counters": 2,
+    "stamp_batches": 2,
+    "stamps": 2,
+    "status_list_snapshots": 2,
+    "verifications": 2,
+    "verifier_credentials": 2
+  },
+  "total_rows": 42,
+  "unjustified_empty_tables": []
+}
