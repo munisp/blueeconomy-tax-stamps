@@ -6,8 +6,8 @@ The existing ix_outbox_published_at indexes a low-selectivity nullable column;
 a partial index over created_at for unpublished rows matches the drain query
 exactly and stays tiny (only unpublished rows are indexed).
 
-Revision ID: 0002_perf_indexes
-Revises: 0001_initial
+Revision ID: 0005_perf_indexes
+Revises: 0004_void_maker_checker
 Create Date: 2026-09-01
 """
 
@@ -15,8 +15,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0002_perf_indexes"
-down_revision = "0001_initial"
+revision = "0005_perf_indexes"
+down_revision = "0004_void_maker_checker"
 branch_labels = None
 depends_on = None
 

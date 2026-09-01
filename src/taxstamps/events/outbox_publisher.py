@@ -76,7 +76,15 @@ async def publish_forever() -> None:
 
 def run_publisher() -> None:
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(publish_forever())
+    # OTel (Phase-7): no-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset; when
+    # set, the aiokafka producer gets W3C traceparent header injection.
+    from taxstamps import telemetry
+
+    telemetry.init_telemetry(None, service_name="blueeconomy-tax-stamps-outbox", version="0.1.0")
+    try:
+        asyncio.run(publish_forever())
+    finally:
+        telemetry.shutdown_telemetry()
 
 
 if __name__ == "__main__":

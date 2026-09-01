@@ -18,7 +18,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -173,9 +173,8 @@ async def issue_chunk(
             issuer_did=settings.issuer_did,
             serial=serial,
             hs_code=line.hs_code,
-            declaration_ref=declaration.declaration_ref,
-            consignee_tin=declaration.consignee_tin,
-            duty_paid_kobo=assessment.total_duty_kobo,
+            batch_id=str(locked.id),
+            assessment_ref=str(assessment.id),
             valid_from=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             valid_until=valid_until.strftime("%Y-%m-%dT%H:%M:%SZ"),
             status_entries=per_stamp_entries,
@@ -228,6 +227,12 @@ async def finalize_batch(
     ).scalars().all()
     locked.merkle_root = merkle_root([s.encode("utf-8") for s in serials])
     locked.status = "READY"
+    # The batch is fully issued (READY); the assessment reaches ISSUED.
+    assessment = (
+        await session.execute(select(Assessment).where(Assessment.id == locked.assessment_id))
+    ).scalar_one()
+    if assessment.status == "ISSUING":
+        assessment.status = "ISSUED"
     await outbox.enqueue(
         session,
         event_type="stamps.issued.v1",
@@ -245,6 +250,58 @@ async def finalize_batch(
     )
     await session.flush()
     return locked
+
+
+# Stamps in these states are terminal for batch-completion purposes.
+TERMINAL_STAMP_STATUSES = ("CONSUMED", "VOID", "EXPIRED", "SUSPECT")
+
+
+async def refresh_batch_terminal_state(
+    session: AsyncSession,
+    *,
+    batch_id: uuid.UUID,
+) -> str | None:
+    """Close out a batch whose stamps are all in terminal states.
+
+    - every stamp VOID            -> batch VOID;
+    - otherwise all stamps in a terminal state -> batch COMPLETED.
+
+    Returns the new batch status, or None when the batch is still live.
+    Called from the consumption path, the void path and the expiry sweeper
+    so a batch never lingers in ACTIVE after its stamps are all spent.
+    """
+    locked = (
+        await session.execute(
+            select(StampBatch).where(StampBatch.id == batch_id).with_for_update()
+        )
+    ).scalar_one()
+    if locked.status in ("COMPLETED", "VOID"):
+        return None
+    if locked.issued_count < locked.quantity:
+        return None  # not fully issued yet; nothing to close out
+    live = (
+        await session.execute(
+            select(func.count()).select_from(Stamp).where(
+                Stamp.batch_id == locked.id, Stamp.status.in_(("ISSUED", "ACTIVE"))
+            )
+        )
+    ).scalar_one()
+    if live:
+        return None
+    voided = (
+        await session.execute(
+            select(func.count()).select_from(Stamp).where(
+                Stamp.batch_id == locked.id, Stamp.status == "VOID"
+            )
+        )
+    ).scalar_one()
+    if voided == locked.quantity:
+        locked.status = "VOID"
+    else:
+        locked.status = "COMPLETED"
+        locked.completed_at = utcnow()
+    await session.flush()
+    return locked.status
 
 
 async def record_inspection(

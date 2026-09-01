@@ -34,12 +34,23 @@ class Settings(BaseSettings):
     redis_url: str = ""                 # nonce / rate-limit / velocity (fail-closed on outage)
     key_directory_path: str = ""        # {kid: b64u pubkey} for inbound envelope verification
     kafka_bootstrap_servers: str = ""   # outbox publisher + declarations consumer
-    kafka_declarations_topic_pattern: str = "declarations.*"
+    # Comma-separated topic patterns (fnmatch-style '*' wildcards). The
+    # port-interoperability producer publishes declarations on
+    # trade.declarations.v1, so it is part of the default set.
+    kafka_declarations_topic_pattern: str = "declarations.*,trade.declarations.v1"
     kafka_consumer_group: str = "blueeconomy-tax-stamps"
     # Producer batching (outbox publisher). Defaults preserve the previous
     # fire-and-await behavior: linger 0 and the aiokafka default batch size.
     kafka_linger_ms: int = 0            # >0 lets the producer coalesce messages
     kafka_max_batch_size: int = 16384   # aiokafka/kafka default
+    # Producer-contract normalization: eventType=mode comma pairs mapping
+    # producer eventTypes (FHIR Basic domain-payload string extension) onto
+    # the structural declaration resource. Fail-closed on unknown modes and
+    # malformed payloads.
+    declaration_event_map: str = "trade.declaration.submitted.v1=declaration"
+    # Trusted JWS kid prefix allow-list for inbound declaration envelopes
+    # (comma-separated). Rejection reason: untrusted-kid.
+    trusted_kid_prefixes: str = "port-interoperability-"
 
     # --- OIDC (Keycloak RS256/EdDSA via JWKS) ---
     oidc_jwks_url: str = ""             # https://keycloak/.../certs
@@ -50,6 +61,7 @@ class Settings(BaseSettings):
     # --- payment rails (financial-controls boundary) ---
     payment_rail: str = ""              # "" | "cvff-tigerbeetle" | "mojaloop"
     financial_controls_endpoint: str = ""
+    financial_controls_token: str = ""  # bearer token for the FC boundary (env-only secret)
 
     # --- service ---
     http_host: str = "0.0.0.0"  # noqa: S104 -- container listener, ingress-terminated
@@ -60,6 +72,9 @@ class Settings(BaseSettings):
     velocity_window_hours: int = 24
     velocity_distinct_devices: int = 3
     rate_limit_per_minute: int = 120
+    # Anomaly throttle for the NON-CONSUMING public scan path: per-serial
+    # scan-rate cap (beyond per-IP) when Redis is present.
+    public_serial_rate_limit_per_minute: int = 10
 
     @field_validator("database_url")
     @classmethod
@@ -86,7 +101,31 @@ class Settings(BaseSettings):
 
     @property
     def payment_rail_configured(self) -> bool:
-        return bool(self.payment_rail and self.financial_controls_endpoint)
+        # A rail is only usable with BOTH an endpoint and a caller token for
+        # the financial-controls boundary; partial configuration fails closed.
+        return bool(
+            self.payment_rail
+            and self.financial_controls_endpoint
+            and self.financial_controls_token
+        )
+
+    @property
+    def kafka_declarations_topic_patterns(self) -> tuple[str, ...]:
+        from taxstamps.events.normalize import parse_kid_prefixes
+
+        return parse_kid_prefixes(self.kafka_declarations_topic_pattern)
+
+    @property
+    def declaration_event_map_parsed(self) -> dict[str, str]:
+        from taxstamps.events.normalize import parse_event_map
+
+        return parse_event_map(self.declaration_event_map)
+
+    @property
+    def trusted_kid_prefix_list(self) -> tuple[str, ...]:
+        from taxstamps.events.normalize import parse_kid_prefixes
+
+        return parse_kid_prefixes(self.trusted_kid_prefixes)
 
 
 @lru_cache

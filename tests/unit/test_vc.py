@@ -21,9 +21,8 @@ def _doc():
         issuer_did="did:web:taxstamps.blueeconomy.gov.ng",
         serial="NG-TBC-2026-0000000001-A",
         hs_code="2402.20",
-        declaration_ref="DECL-2026-000123",
-        consignee_tin="12345678-0001",
-        duty_paid_kobo=800_000,
+        batch_id="b1b2c3d4-0000-4000-8000-000000000001",
+        assessment_ref="a1a2a3a4-0000-4000-8000-000000000001",
         valid_from="2026-07-01T00:00:00Z",
         valid_until="2027-07-01T00:00:00Z",
         status_entries=[],
@@ -43,8 +42,19 @@ def test_vc_context_and_type(signing_key):
     assert signed["type"] == ["VerifiableCredential", "ExciseTaxStamp"]
     subject = signed["credentialSubject"]
     assert subject["serial"] == "NG-TBC-2026-0000000001-A"
-    assert subject["dutyPaidKobo"] == 800_000
-    assert subject["consigneeTin"] == "12345678-0001"
+    assert subject["stampScope"] == "unit"
+    assert subject["batchId"] == "b1b2c3d4-0000-4000-8000-000000000001"
+    assert subject["assessmentRef"] == "a1a2a3a4-0000-4000-8000-000000000001"
+
+
+def test_unit_credential_carries_no_consignment_financials(signing_key):
+    """TS-1: a unit-level stamp must never disclose the consignment duty."""
+    signed = issue_proof(_doc(), signing_key, "vm")
+    subject = signed["credentialSubject"]
+    for forbidden in ("dutyPaidKobo", "totalDutyKobo", "dutyKobo",
+                      "consigneeTin", "declarationRef"):
+        assert forbidden not in subject
+        assert forbidden not in signed
 
 
 def test_tampered_subject_rejected(signing_key):

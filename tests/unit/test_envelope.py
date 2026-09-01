@@ -174,3 +174,22 @@ def test_key_permissions_enforced(tmp_path, monkeypatch):
     os.chmod(p, 0o600)
     key = load_signing_key(str(p), "kid-0")
     assert isinstance(key.public_key, Ed25519PublicKey)
+
+
+def test_permissive_key_file_refused_in_production(tmp_path, monkeypatch):
+    from taxstamps.crypto.eddsa import generate_pkcs8_pem, load_signing_key
+
+    monkeypatch.setenv("ENV", "production")
+    monkeypatch.setenv("TAXSTAMPS_ALLOW_PERMISSIVE_KEY_FILE", "1")
+    p = tmp_path / "key.pem"
+    p.write_bytes(generate_pkcs8_pem())
+    with pytest.raises(JwsError) as exc:
+        load_signing_key(str(p), "kid-0")
+    assert exc.value.reason == "permissive-key-file-refused"
+    # Non-production keeps the development escape hatch working.
+    monkeypatch.setenv("ENV", "development")
+    import os
+
+    os.chmod(p, 0o600)
+    key = load_signing_key(str(p), "kid-0")
+    assert isinstance(key.public_key, Ed25519PublicKey)

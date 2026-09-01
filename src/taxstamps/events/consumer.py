@@ -1,4 +1,4 @@
-"""declarations.* Kafka consumer.
+"""trade.declarations.v1 Kafka consumer.
 
 Consumes customs declaration events in canonical envelope v1.0 (FHIR message
 Bundle wrap, JWS-EdDSA signature verified against the mounted key directory —
@@ -6,7 +6,12 @@ fail-closed: rejected envelopes are never persisted), persists the
 declaration + line items, dedupes on the envelope eventId, and commits the
 Kafka offset only after the database commit.
 
-Expected primary resource (declarations.imported.v1 style), carried as the
+Subscribed topics are governed by ``kafka_declarations_topic_pattern``
+(comma-separated patterns; the default set includes
+``trade.declarations.v1``, the blueeconomy-port-interoperability producer
+topic).
+
+Expected primary resource (CustomsDeclarationFiled style), carried as the
 FHIR Bundle's single entry resource:
 
   {"@type": "...CustomsDeclarationFiled", "declarationRef": "...",
@@ -14,6 +19,12 @@ FHIR Bundle's single entry resource:
    "lineItems": [{"hsCode": "...", "description": "...", "quantity": n,
                   "unit": "STICK|LITRE|UNIT", "customsValueKobo": n,
                   "stampsRequired": n}]}
+
+The real producer (blueeconomy-port-interoperability) wraps its payload in
+a FHIR ``Basic`` resource whose ``domain-payload`` extension carries the
+Declaration JSON (snake_case, single ``hs_code``);
+``taxstamps.events.normalize`` maps that shape onto the structural resource
+per the configured event map; unrecognized/malformed payloads fail closed.
 """
 
 from __future__ import annotations
@@ -29,6 +40,10 @@ from taxstamps.config import get_settings
 from taxstamps.crypto.eddsa import KeyDirectory
 from taxstamps.db import dispose_engine, init_engine, session
 from taxstamps.events.envelope import EnvelopeError, verify_envelope
+from taxstamps.events.normalize import (
+    check_trusted_kid,
+    normalize_resource,
+)
 from taxstamps.models import Declaration, DeclarationLine, ProcessedEvent, utcnow
 from taxstamps.services import audit
 
@@ -37,17 +52,44 @@ log = logging.getLogger("taxstamps.consumer")
 _REQUIRED_RESOURCE_FIELDS = {"declarationRef", "consigneeTin", "lineItems"}
 
 
+def topic_patterns_regex(patterns: tuple[str, ...]) -> str:
+    """Compile the configured topic patterns (``.``-separated, ``*``
+    wildcard) into one anchored alternation regex, e.g.
+    ``("declarations.*", "trade.declarations.v1")`` ->
+    ``^(declarations\\..*|trade\\.declarations\\.v1)$``.
+    Fails closed on an empty pattern set."""
+    alternatives = [p.replace(".", r"\.").replace("*", ".*") for p in patterns]
+    if not alternatives:
+        raise RuntimeError("TAXSTAMPS_KAFKA_DECLARATIONS_TOPIC_PATTERN must not be empty")
+    return "^(" + "|".join(alternatives) + ")$"
+
+
 async def apply_declaration_envelope(
     envelope: dict[str, Any],
     directory: KeyDirectory,
     db_session: Any = None,
+    *,
+    event_map: dict[str, str] | None = None,
+    trusted_kid_prefixes: tuple[str, ...] | None = None,
 ) -> str:
     """Verify + persist one declaration envelope. Returns a disposition:
     'applied' | 'duplicate'. Raises EnvelopeError/ValueError on rejection.
 
+    ``event_map`` / ``trusted_kid_prefixes`` default to the configured
+    producer-contract normalization (TAXSTAMPS_DECLARATION_EVENT_MAP /
+    TAXSTAMPS_TRUSTED_KID_PREFIXES); tests inject them explicitly.
+
     When ``db_session`` is supplied the caller owns the transaction/commit;
     otherwise a session is opened and committed here (consumer path)."""
+    if event_map is None or trusted_kid_prefixes is None:
+        settings = get_settings()
+        if event_map is None:
+            event_map = settings.declaration_event_map_parsed
+        if trusted_kid_prefixes is None:
+            trusted_kid_prefixes = settings.trusted_kid_prefix_list
+    check_trusted_kid(envelope, trusted_kid_prefixes)
     resource = verify_envelope(envelope, directory)
+    resource = normalize_resource(envelope, resource, event_map)
     missing = _REQUIRED_RESOURCE_FIELDS - set(resource)
     if missing:
         raise ValueError(f"declaration resource missing fields {sorted(missing)}")
@@ -114,7 +156,7 @@ async def consume_forever() -> None:
 
     init_engine(settings.database_url)
     directory = KeyDirectory.load(settings.key_directory_path)
-    pattern = "^" + settings.kafka_declarations_topic_pattern.replace(".", r"\.").replace("*", ".*") + "$"
+    pattern = topic_patterns_regex(settings.kafka_declarations_topic_patterns)
     consumer = AIOKafkaConsumer(
         bootstrap_servers=settings.kafka_bootstrap_servers,
         group_id=settings.kafka_consumer_group,
@@ -145,7 +187,15 @@ async def consume_forever() -> None:
 
 def run_consumer() -> None:
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(consume_forever())
+    # OTel (Phase-7): no-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset; when
+    # set, consumed records extract the W3C traceparent from Kafka headers.
+    from taxstamps import telemetry
+
+    telemetry.init_telemetry(None, service_name="blueeconomy-tax-stamps-consumer", version="0.1.0")
+    try:
+        asyncio.run(consume_forever())
+    finally:
+        telemetry.shutdown_telemetry()
 
 
 if __name__ == "__main__":

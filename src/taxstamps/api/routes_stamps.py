@@ -12,7 +12,7 @@ from taxstamps.api import schemas
 from taxstamps.api.deps import IdentityDep, SessionDep, SettingsDep, require_policy
 from taxstamps.models import Assessment, Stamp, StampBatch
 from taxstamps.services import audit, issuance
-from taxstamps.services.verification import VerificationError, void_stamp
+from taxstamps.services.verification import VerificationError, approve_void, request_void
 
 router = APIRouter(prefix="/v1")
 
@@ -213,26 +213,52 @@ async def get_stamp(
     }
 
 
-@router.post("/stamps/{serial}/void")
-async def void_stamp_route(
+@router.post("/stamps/{serial}/void", status_code=202)
+async def request_void_route(
     serial: str,
     body: schemas.VoidIn,
+    request: Request,
+    session: SessionDep,
+    identity: IdentityDep,
+) -> dict[str, Any]:
+    """Request a stamp void (maker step). The void executes only when a
+    DIFFERENT excise-approver approves it via /void/approve."""
+    require_policy(request, identity, "stamp", "void", "CONFIDENTIAL")
+    try:
+        void_request = await request_void(
+            session, serial=serial, reason=body.reason, principal_sub=identity.subject,
+        )
+    except VerificationError as exc:
+        status = 404 if exc.reason == "not-found" else 422
+        raise HTTPException(status_code=status, detail={"reason": exc.reason, "detail": str(exc)}) from exc
+    await audit.record(session, "stamp.void-requested", {
+        "serial": void_request.serial, "reason": body.reason, "principal": identity.subject,
+    })
+    await session.commit()
+    return {"serial": void_request.serial, "voidStatus": void_request.status}
+
+
+@router.post("/stamps/{serial}/void/approve")
+async def approve_void_route(
+    serial: str,
     request: Request,
     session: SessionDep,
     settings: SettingsDep,
     identity: IdentityDep,
 ) -> dict[str, Any]:
+    """Approve a pending void request (checker step). Requester != approver:
+    a single-actor void is rejected 409, consistent with assessments."""
     require_policy(request, identity, "stamp", "void", "CONFIDENTIAL")
     try:
-        stamp = await void_stamp(
-            session, serial=serial, reason=body.reason, principal_sub=identity.subject,
+        stamp = await approve_void(
+            session, serial=serial, principal_sub=identity.subject,
             settings=settings, signing_key=request.app.state.signing_key,
         )
     except VerificationError as exc:
-        status = 404 if exc.reason == "not-found" else 422
+        status = {"not-found": 404, "self-approval": 409}.get(exc.reason, 422)
         raise HTTPException(status_code=status, detail={"reason": exc.reason, "detail": str(exc)}) from exc
     await audit.record(session, "stamp.voided", {
-        "serial": stamp.serial, "reason": body.reason, "principal": identity.subject,
+        "serial": stamp.serial, "principal": identity.subject,
     })
     await session.commit()
     return {"serial": stamp.serial, "status": stamp.status}

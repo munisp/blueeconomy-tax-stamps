@@ -35,7 +35,7 @@ micro-degrees only) are prohibited.
 ## Workflow
 
 ```
-declaration event (Kafka declarations.*, envelope v1.0, JWS-verified)
+declaration event (Kafka trade.declarations.v1, envelope v1.0, JWS-verified)
   → TaxStampAssessment (server-side tariff pricing)
   → maker-checker approval (submitter-cannot-approve; risk tiers LOW/STANDARD/HIGH = 1/2/3 approvers)
   → payment intent + rail receipt (financial-controls boundary; EXACT amount+currency match; mismatch QUARANTINED)
@@ -58,9 +58,10 @@ cursor).
 
 ### Verification: first-scan-wins
 
-- The first valid scan of an ACTIVE stamp **consumes** it (ferry-boarding
-  pattern), serialized with `SELECT … FOR UPDATE`; an 8-device race has
-  exactly one winner (tested).
+- The first **credentialed** scan of an ACTIVE stamp **consumes** it
+  (ferry-boarding pattern), serialized with `SELECT … FOR UPDATE`; an
+  8-device race has exactly one winner (tested). First-scan-wins clone
+  detection applies ONLY to credentialed consumption scans.
 - Repeat scans return `already_verified` with first-scan evidence; a repeat
   from a **different device** returns `clone_suspect` and sets the stamp's
   `suspect` bit in the published status list.
@@ -71,15 +72,23 @@ cursor).
   stored; no shared fleet secret) + Redis single-use nonce + rate limit.
   Redis outage → 503 (fail-closed, never a fail-open scan).
 - `POST /v1/verify/public` is self-service for importers/consumers: no
-  device credential; when a full credential is presented it additionally
-  performs the offline checks (eddsa-jcs-2022 proof + status-list bits).
+  device credential and **non-consuming** — it returns validity/outcome and
+  status-list state but never transitions ACTIVE → CONSUMED (public serials
+  are enumerable; a consuming public path would allow mass stamp-burning).
+  Anomaly throttling applies per-IP plus a per-serial scan-rate cap
+  (`TAXSTAMPS_PUBLIC_SERIAL_RATE_LIMIT_PER_MINUTE`, default 10) when Redis
+  is present; when a full credential is presented it additionally performs
+  the offline checks (eddsa-jcs-2022 proof + status-list bits).
 
 ### VC profile
 
 - `@context` exactly `["https://www.w3.org/ns/credentials/v2"]`; type
   `["VerifiableCredential", "ExciseTaxStamp"]`.
-- `credentialSubject`: serial, hsCode, declarationRef, consigneeTin,
-  dutyPaidKobo; `validFrom`/`validUntil` window.
+- `credentialSubject` is **unit-scoped only**: `stampScope` ("unit"),
+  serial, hsCode, batchId, assessmentRef; `validFrom`/`validUntil` window.
+  Consignment-level data (duty amount, declaration reference, consignee
+  TIN) is deliberately NOT in the public credential — it stays resolvable
+  via `assessmentRef` for authorized verifiers (policy-gated read path).
 - Proof: Data Integrity `eddsa-jcs-2022` (JCS canonicalization, SHA-256 of
   proof options ‖ SHA-256 of document, Ed25519, multibase base58btc
   `proofValue`). No network calls at issue or verify time.
@@ -105,6 +114,29 @@ cursor).
   (fail-closed) and capabilities reports the publisher unavailable.
 - **Merkle anchoring**: RFC 6962-style root over batch serials at
   finalization.
+- **Expiry sweeper** (`taxstamps-expiry-sweeper`, runs alongside the outbox
+  publisher): claims expired stamps in `FOR UPDATE SKIP LOCKED` batches,
+  flips `status = EXPIRED` and sets the `expired` status-list bit, so the
+  signed status list — the verifier-facing truth — reflects expiry even
+  when nobody scans.
+- **Zero-rated assessments** (e.g. pharmaceuticals): settle through a
+  policy-gated, audited zero-rated path (`POST
+  /v1/assessments/{id}/zero-rated-settlement`) — never through a rail —
+  with a settled zero-amount intent as the durable record. Positive-amount
+  assessments still require an exact rail receipt.
+- **Quarantine resolution**: a mismatched remittance is resolved only by an
+  ops/finance role posting a SUPERSEDING receipt (`POST
+  /v1/payments/intents/{id}/quarantine-resolution`) that settles the intent
+  (exact match still required) or marks it FAILED with reason; the original
+  receipt stays immutable.
+- **Maker-checker stamp voids**: a void request (excise-approver tier)
+  executes only on approval by a DIFFERENT excise-approver
+  (`POST /v1/stamps/{serial}/void` → `POST /v1/stamps/{serial}/void/approve`;
+  single-actor → 409), consistent with the assessment pattern.
+- **Ops endpoints gated**: `GET /v1/capabilities` and
+  `GET /v1/ops/audit-chain` require `ops:read` (auditor role) — anonymous
+  401, non-auditor 403, OIDC unconfigured 503 (fail-closed). Probes and
+  verifier-facing publications stay public.
 
 ## Honesty registry
 
@@ -124,7 +156,10 @@ PKCS#8 PEM, file-mounted, `0600`, never committed),
 
 Optional (fail-closed consumers when absent): `TAXSTAMPS_REDIS_URL`,
 `TAXSTAMPS_KEY_DIRECTORY_PATH` (inbound envelope verification),
-`TAXSTAMPS_KAFKA_BOOTSTRAP_SERVERS`, `TAXSTAMPS_OIDC_JWKS_URL` /
+`TAXSTAMPS_KAFKA_BOOTSTRAP_SERVERS`,
+`TAXSTAMPS_KAFKA_DECLARATIONS_TOPIC_PATTERN` (default
+`trade.declarations.v1`, the blueeconomy-port-interoperability producer
+topic; `*` wildcard supported), `TAXSTAMPS_OIDC_JWKS_URL` /
 `TAXSTAMPS_OIDC_JWKS_PATH` + `TAXSTAMPS_OIDC_ISSUER` (+`_AUDIENCE`),
 `TAXSTAMPS_PAYMENT_RAIL` + `TAXSTAMPS_FINANCIAL_CONTROLS_ENDPOINT`,
 `TAXSTAMPS_STATUS_LIST_BASE_URL`, plus tuning vars documented in
@@ -133,8 +168,11 @@ Optional (fail-closed consumers when absent): `TAXSTAMPS_REDIS_URL`,
 ## Processes
 
 One image, three entrypoints: `taxstamps-api` (HTTP),
-`taxstamps-consumer` (`declarations.*` Kafka consumer, envelope-verified,
-deduped on eventId, offset committed after DB commit), `taxstamps-outbox`
+`taxstamps-consumer` (`trade.declarations.v1` Kafka consumer, envelope-verified,
+deduped on eventId, offset committed after DB commit; maps the
+blueeconomy-port-interoperability FHIR Basic / `domain-payload` declaration
+payload onto the canonical resource shape — see
+`src/taxstamps/events/consumer.py`), `taxstamps-outbox`
 (outbox publisher). Migrations: `alembic upgrade head`
 (`TAXSTAMPS_DATABASE_URL` required).
 

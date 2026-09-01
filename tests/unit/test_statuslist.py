@@ -12,6 +12,12 @@ from taxstamps.crypto.statuslist import (
 )
 
 
+def test_fleet_conformance_list_size():
+    """Fleet pin: credential-verification STATUS_LIST_BITS and mobile
+    STATUS_LIST_BITS are 1_048_576; tax-stamps must agree."""
+    assert DEFAULT_LIST_SIZE_BITS == 1_048_576
+
+
 def test_bit_ops_w3c_ordering():
     sl = StatusList(size_bits=64)
     assert not sl.get(0)
