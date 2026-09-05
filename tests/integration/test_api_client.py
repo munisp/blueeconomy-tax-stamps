@@ -134,3 +134,13 @@ def test_ops_endpoints_pbac(oidc_client):
         assert client.get(path, headers={"Authorization": f"Bearer {officer}"}).status_code == 403
         auditor = mint("auditor-1", ["auditor"])
         assert client.get(path, headers={"Authorization": f"Bearer {auditor}"}).status_code == 200
+
+
+def test_security_headers_present(client):
+    """S5 regression: every response carries the platform security headers."""
+    for path in ("/healthz", "/v1/capabilities"):
+        resp = client.get(path)
+        assert resp.headers["strict-transport-security"].startswith("max-age=")
+        assert resp.headers["x-content-type-options"] == "nosniff"
+        assert resp.headers["x-frame-options"] == "DENY"
+        assert resp.headers["referrer-policy"] == "no-referrer"

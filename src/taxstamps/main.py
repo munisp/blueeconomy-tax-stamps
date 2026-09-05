@@ -106,6 +106,16 @@ async def unhandled_handler(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
 app.include_router(ops_router)
 app.include_router(ops_secured_router)
 app.include_router(flow_router)
