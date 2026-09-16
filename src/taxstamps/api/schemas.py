@@ -80,6 +80,10 @@ class VerifyIn(BaseModel):
 
     serial: str = Field(min_length=1, max_length=64)
     nonce: str = Field(min_length=8, max_length=128)
+    # The stamp's verifiable credential (QR payload). Required for consumption:
+    # the proof, serial match and status-list state are verified BEFORE the
+    # stamp is consumed (H3); the enumerable serial alone is never a capability.
+    credential: dict[str, Any] | None = None
     lat_micros: int | None = Field(default=None, ge=-90_000_000, le=90_000_000)
     long_micros: int | None = Field(default=None, ge=-180_000_000, le=180_000_000)
 
