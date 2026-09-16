@@ -3,10 +3,16 @@
 POST /v1/verify        — authenticated field verification: per-verifier
                          credential (no shared fleet secret), Redis single-use
                          nonce + rate limit (fail-closed on Redis outage).
-POST /v1/verify/public — importer/consumer self-service: no device credential;
-                         performs the stamp consumption scan plus, when a full
-                         credential is presented, offline signature + status-list
-                         checks.
+                         CONSUMES the stamp, and only after the presented
+                         verifiable credential's proof, serial match and
+                         status-list state pass (H3): the serial alone is
+                         enumerable and never a capability.
+POST /v1/verify/public — importer/consumer self-service: no device credential.
+                         NON-CONSUMING pre-check (H3): reports stamp state and
+                         performs offline signature + status-list checks when
+                         a full credential is presented, but never mutates the
+                         stamp, so anonymous callers can neither burn ACTIVE
+                         serials nor launder clones as first_scan_verifier.
 """
 
 from __future__ import annotations
@@ -46,6 +52,19 @@ async def _authenticate_verifier(session, verifier_id: str, credential: str) -> 
     return row
 
 
+async def _load_status_lists(session) -> dict[str, StatusList]:  # type: ignore[no-untyped-def]
+    """Current status lists for every purpose, for offline credential checks."""
+    status_lists: dict[str, StatusList] = {}
+    for purpose in PURPOSES:
+        credential_doc = await statuslists.current_credential(session, purpose)
+        if credential_doc is not None:
+            from taxstamps.crypto.statuslist import parse_status_list_credential
+
+            _, sl = parse_status_list_credential(credential_doc)
+            status_lists[purpose] = sl
+    return status_lists
+
+
 @router.post("/verify")
 async def verify(
     body: schemas.VerifyIn,
@@ -78,6 +97,9 @@ async def verify(
         signing_key=request.app.state.signing_key,
         lat_micros=body.lat_micros,
         long_micros=body.long_micros,
+        credential=body.credential,
+        consume=True,
+        status_lists=await _load_status_lists(session),
     )
     await session.commit()
     return result
@@ -133,6 +155,7 @@ async def verify_public(
             signing_key=request.app.state.signing_key,
             lat_micros=body.lat_micros,
             long_micros=body.long_micros,
+            consume=False,
         )
         response.update(result)
     await session.commit()
