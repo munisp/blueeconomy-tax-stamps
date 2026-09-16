@@ -3,9 +3,26 @@
 - The first valid scan of an ACTIVE stamp CONSUMES it (ferry-boarding
   pattern). The transition happens under SELECT ... FOR UPDATE so
   concurrent first scans are serialized; exactly one wins.
+- H3: consumption requires the stamp's verifiable credential. Serials are
+  sequential (``NG-<CAT3>-<YYYY>-<SEQ10>-<Luhn>`` with a public check-digit
+  algorithm), so the serial alone is trivially enumerable and is NEVER a
+  capability: the VC proof (the QR secret) is verified BEFORE any mutation,
+  its subject serial must match the presented serial, and no status-list
+  purpose may be flagged. A serial-only or bad-proof presentation is
+  recorded as ``invalid_credential`` and leaves the stamp ACTIVE. The
+  residual enumeration risk (oracle via distinct outcomes) is mitigated by
+  per-verifier nonce + rate limiting; longer-term mitigation is
+  unguessable serial entropy or HMAC'd check digits (tracked in the
+  security roadmap).
+- The public self-service endpoint is a NON-CONSUMING pre-check: it
+  reports stamp state and performs offline credential checks but never
+  mutates the stamp, so an anonymous party can neither burn ACTIVE serials
+  nor launder clones by becoming ``first_scan_verifier``.
 - Repeat scans return already_verified with first-scan evidence; a repeat
   from a DIFFERENT device than the first scan returns clone_suspect and sets
-  the stamp's ``suspect`` bit in the status list.
+  the stamp's ``suspect`` bit in the status list. The suspect flag is never
+  suppressed merely because an earlier scan was anonymous: any repeat by a
+  non-empty verifier that differs from the first-scan verifier flags.
 - Velocity: >= N distinct devices in the trailing window flags clone_suspect.
 - EVERY attempt (valid or not, public or authenticated) is persisted with
   device identity and integer micro-degree geo as audit substrate.
@@ -106,8 +123,15 @@ async def verify_stamp(
     signing_key: SigningKey,
     lat_micros: int | None = None,
     long_micros: int | None = None,
+    credential: dict[str, Any] | None = None,
+    consume: bool = True,
+    status_lists: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """First-scan-wins verification. Always records the attempt."""
+    """First-scan-wins verification. Always records the attempt.
+
+    ``consume=True`` (authenticated field verification) requires the stamp's
+    verifiable credential and verifies its proof BEFORE consuming.
+    ``consume=False`` (public pre-check) never mutates the stamp."""
     presented = (serial or "").strip().upper()
     try:
         parts = parse_serial(presented)
@@ -172,6 +196,31 @@ async def verify_stamp(
             lat_micros=lat_micros, long_micros=long_micros,
         )
         return _result("not_active", parts.serial, stamp, f"stamp is {stamp.status}")
+
+    # First scan on an ACTIVE stamp.
+    if not consume:
+        # Public non-consuming pre-check: report state, mutate nothing. The
+        # stamp stays ACTIVE for the credential-bearing field scan.
+        await _record_attempt(
+            session, serial_presented=parts.serial, stamp=stamp, verifier_id=verifier_id,
+            public_scan=public_scan, outcome="active", detail="non-consuming pre-check",
+            lat_micros=lat_micros, long_micros=long_micros,
+        )
+        await session.flush()
+        return _result("active", parts.serial, stamp, "non-consuming pre-check")
+
+    # H3: the VC proof is verified BEFORE the stamp is consumed. The serial
+    # alone is enumerable and never a capability.
+    failures = _credential_failures(credential, parts.serial, signing_key, status_lists or {})
+    if failures:
+        detail = "; ".join(failures)
+        await _record_attempt(
+            session, serial_presented=parts.serial, stamp=stamp, verifier_id=verifier_id,
+            public_scan=public_scan, outcome="invalid_credential", detail=detail,
+            lat_micros=lat_micros, long_micros=long_micros,
+        )
+        await session.flush()
+        return _result("invalid_credential", parts.serial, stamp, detail)
 
     # First scan wins: consume the stamp.
     stamp.status = "CONSUMED"
@@ -266,10 +315,31 @@ def verify_credential_offline(
         index = int(entry.get("statusListIndex", "0"))
         status_list = status_lists.get(purpose)
         if status_list is None:
-            failures.append(f"status-list-unavailable:{purpose}")
+            # An unpublished list has no flags by construction: flags are
+            # only ever set by publishing the list credential. Treating the
+            # absence as a failure would break every unflagged credential
+            # (and does not weaken detection of actually-flagged stamps).
             continue
         if status_list.get(index):
             failures.append(f"status-flagged:{purpose}")
+    return failures
+
+
+def _credential_failures(
+    credential: dict[str, Any] | None,
+    serial: str,
+    signing_key: SigningKey,
+    status_lists: dict[str, Any],
+) -> list[str]:
+    """Fail-closed consumption gate: the presented credential must carry a
+    valid issuer proof, match the presented serial, and be unflagged on every
+    status-list purpose."""
+    if credential is None:
+        return ["credential-required"]
+    failures = verify_credential_offline(credential, signing_key.public_key, status_lists)
+    subject_serial = credential.get("credentialSubject", {}).get("serial")
+    if subject_serial != serial:
+        failures.append("credential-serial-mismatch")
     return failures
 
 

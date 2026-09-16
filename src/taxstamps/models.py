@@ -330,6 +330,8 @@ class Inspection(Base):
 VERIFICATION_OUTCOMES = (
     "valid", "already_verified", "clone_suspect", "unknown_serial",
     "malformed_serial", "not_active", "void", "expired",
+    # H3: consumption gate + non-consuming public pre-check outcomes.
+    "invalid_credential", "active",
 )
 
 
