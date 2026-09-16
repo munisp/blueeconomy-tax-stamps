@@ -29,12 +29,24 @@ async def _active_stamps(session, settings, signing_key, stamps=10):
     return rows
 
 
+
+async def _consume_kwargs(session, stamp):
+    """Credential + status lists required for the H3 consumption gate."""
+    status_lists = {}
+    for purpose in ("void", "expired", "suspect"):
+        cred = await statuslists.current_credential(session, purpose)
+        if cred is not None:
+            _, sl = parse_status_list_credential(cred)
+            status_lists[purpose] = sl
+    return {"credential": stamp.credential, "status_lists": status_lists}
+
 async def test_first_scan_wins_then_already_verified(session, settings, signing_key):
     stamps = await _active_stamps(session, settings, signing_key, 1)
     serial = stamps[0].serial
     r1 = await verification.verify_stamp(
         session, serial=serial, verifier_id="dev-1", public_scan=False,
         settings=settings, signing_key=signing_key, lat_micros=6_500_000, long_micros=3_400_000,
+        **(await _consume_kwargs(session, stamps[0])),
     )
     await session.commit()
     assert r1["outcome"] == "valid"
@@ -52,7 +64,8 @@ async def test_repeat_scan_from_other_device_clone_suspect(session, settings, si
     stamps = await _active_stamps(session, settings, signing_key, 1)
     serial = stamps[0].serial
     await verification.verify_stamp(session, serial=serial, verifier_id="dev-1",
-                                    public_scan=False, settings=settings, signing_key=signing_key)
+                                    public_scan=False, settings=settings, signing_key=signing_key,
+                                    **(await _consume_kwargs(session, stamps[0])))
     await session.commit()
     r = await verification.verify_stamp(session, serial=serial, verifier_id="dev-2",
                                         public_scan=False, settings=settings, signing_key=signing_key)
@@ -78,6 +91,7 @@ async def test_first_scan_race_exactly_one_winner(session_factory, settings, sig
             result = await verification.verify_stamp(
                 s, serial=serial, verifier_id=device, public_scan=False,
                 settings=settings, signing_key=signing_key,
+                **(await _consume_kwargs(s, stamps[0])),
             )
             await s.commit()
             return result["outcome"]
@@ -111,7 +125,8 @@ async def test_velocity_clone_suspect_flag(session, settings, signing_key):
     serial = stamps[0].serial
     # three distinct devices inside 24h
     await verification.verify_stamp(session, serial=serial, verifier_id="dev-a",
-                                    public_scan=False, settings=settings, signing_key=signing_key)
+                                    public_scan=False, settings=settings, signing_key=signing_key,
+                                    **(await _consume_kwargs(session, stamps[0])))
     await verification.verify_stamp(session, serial=serial, verifier_id="dev-b",
                                     public_scan=False, settings=settings, signing_key=signing_key)
     await verification.verify_stamp(session, serial=serial, verifier_id="dev-c",
@@ -169,3 +184,104 @@ async def test_offline_credential_check(session, settings, signing_key):
         stamp.credential, signing_key.public_key, status_lists
     )
     assert "status-flagged:void" in failures
+
+
+async def test_consumption_requires_valid_vc(session, settings, signing_key):
+    """H3: the enumerable serial alone never consumes; a valid proof does."""
+    stamps = await _active_stamps(session, settings, signing_key, 1)
+    stamp = stamps[0]
+    serial = stamp.serial
+
+    # Serial-only presentation: recorded, not consumed.
+    r = await verification.verify_stamp(
+        session, serial=serial, verifier_id="dev-1", public_scan=False,
+        settings=settings, signing_key=signing_key,
+    )
+    await session.commit()
+    assert r["outcome"] == "invalid_credential"
+    assert "credential-required" in r["detail"]
+    await session.refresh(stamp)
+    assert stamp.status == "ACTIVE"
+    assert stamp.first_scan_at is None
+
+    # A credential minted for a DIFFERENT serial is rejected.
+    other = await _active_stamps(session, settings, signing_key, 1)
+    r = await verification.verify_stamp(
+        session, serial=serial, verifier_id="dev-1", public_scan=False,
+        settings=settings, signing_key=signing_key,
+        credential=other[0].credential, status_lists={},
+    )
+    await session.commit()
+    assert r["outcome"] == "invalid_credential"
+    assert "credential-serial-mismatch" in r["detail"]
+    await session.refresh(stamp)
+    assert stamp.status == "ACTIVE"
+
+    # A tampered proof is rejected.
+    import copy
+    tampered = copy.deepcopy(stamp.credential)
+    tampered["credentialSubject"]["dutyPaidKobo"] = 1
+    r = await verification.verify_stamp(
+        session, serial=serial, verifier_id="dev-1", public_scan=False,
+        settings=settings, signing_key=signing_key, credential=tampered,
+        **{"status_lists": (await _consume_kwargs(session, stamp))["status_lists"]},
+    )
+    await session.commit()
+    assert r["outcome"] == "invalid_credential"
+    await session.refresh(stamp)
+    assert stamp.status == "ACTIVE"
+
+    # The valid credential consumes exactly once.
+    r = await verification.verify_stamp(
+        session, serial=serial, verifier_id="dev-1", public_scan=False,
+        settings=settings, signing_key=signing_key,
+        **(await _consume_kwargs(session, stamp)),
+    )
+    await session.commit()
+    assert r["outcome"] == "valid"
+    await session.refresh(stamp)
+    assert stamp.status == "CONSUMED"
+
+
+async def test_public_precheck_never_consumes(session, settings, signing_key):
+    """H3: the anonymous pre-check reports state but mutates nothing, so it
+    can neither burn an ACTIVE serial nor launder a clone as first scanner."""
+    stamps = await _active_stamps(session, settings, signing_key, 1)
+    stamp = stamps[0]
+    serial = stamp.serial
+    r = await verification.verify_stamp(
+        session, serial=serial, verifier_id="", public_scan=True,
+        settings=settings, signing_key=signing_key, consume=False,
+    )
+    await session.commit()
+    assert r["outcome"] == "active"
+    await session.refresh(stamp)
+    assert stamp.status == "ACTIVE"
+    assert stamp.first_scan_at is None
+    # The credential-bearing field scan still wins the first scan.
+    r = await verification.verify_stamp(
+        session, serial=serial, verifier_id="dev-1", public_scan=False,
+        settings=settings, signing_key=signing_key,
+        **(await _consume_kwargs(session, stamp)),
+    )
+    await session.commit()
+    assert r["outcome"] == "valid"
+    assert r["firstScan"]["verifierId"] == "dev-1"
+
+
+async def test_suspect_never_suppressed_for_anonymous_first_scan(session, settings, signing_key):
+    """A repeat by a real verifier after an anonymous first scan flags
+    clone_suspect; anonymity of the first scan never launders the repeat."""
+    stamps = await _active_stamps(session, settings, signing_key, 1)
+    stamp = stamps[0]
+    stamp.status = "CONSUMED"
+    stamp.first_scan_verifier = ""
+    from datetime import UTC, datetime
+    stamp.first_scan_at = datetime.now(UTC)
+    await session.commit()
+    r = await verification.verify_stamp(
+        session, serial=stamp.serial, verifier_id="dev-1", public_scan=False,
+        settings=settings, signing_key=signing_key,
+    )
+    await session.commit()
+    assert r["outcome"] == "clone_suspect"
