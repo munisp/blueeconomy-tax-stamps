@@ -1,34 +1,51 @@
-"""Verification: first-scan-wins with clone-suspect analytics.
+"""First-scan-wins verification with full audit persistence.
 
 - The first valid scan of an ACTIVE stamp CONSUMES it (ferry-boarding
   pattern). The transition happens under SELECT ... FOR UPDATE so
   concurrent first scans are serialized; exactly one wins.
+- H3: consumption requires the stamp's verifiable credential. Serials are
+  sequential (``NG-<CAT3>-<YYYY>-<SEQ10>-<Luhn>`` with a public check-digit
+  algorithm), so the serial alone is trivially enumerable and is NEVER a
+  capability: the VC proof (the QR secret) is verified BEFORE any mutation,
+  its subject serial must match the presented serial, and no status-list
+  purpose may be flagged. A serial-only or bad-proof presentation is
+  recorded as ``invalid_credential`` and leaves the stamp ACTIVE. The
+  residual enumeration risk (oracle via distinct outcomes) is mitigated by
+  per-verifier nonce + rate limiting; longer-term mitigation is
+  unguessable serial entropy or HMAC'd check digits (tracked in the
+  security roadmap).
+- The public self-service endpoint is a NON-CONSUMING pre-check: it
+  reports stamp state and performs offline credential checks but never
+  mutates the stamp, so an anonymous party can neither burn ACTIVE serials
+  nor launder clones by becoming ``first_scan_verifier``.
 - Repeat scans return already_verified with first-scan evidence; a repeat
   from a DIFFERENT device than the first scan returns clone_suspect and sets
-  the stamp's ``suspect`` bit in the status list.
+  the stamp's ``suspect`` bit in the status list. The suspect flag is never
+  suppressed merely because an earlier scan was anonymous: any repeat by a
+  non-empty verifier that differs from the first-scan verifier flags.
 - Velocity: >= N distinct devices in the trailing window flags clone_suspect.
 - EVERY attempt (valid or not, public or authenticated) is persisted with
   device identity and integer micro-degree geo as audit substrate.
-- Redis (nonce / rate limit) failure closes the endpoint: 503, never a
-  fail-open scan.
+
+Offline (air-gapped) verification: the QR carries the full verifiable
+credential; ``verify_credential_offline`` checks the issuer's Ed25519 proof
+plus the cached status-list bits without any network access.
 """
 
 from __future__ import annotations
 
 import hashlib
-import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from taxstamps.config import Settings
-from taxstamps.crypto.eddsa import SigningKey
-from taxstamps.crypto.vc import VCError, verify_proof
-from taxstamps.domain.serials import SerialError, parse_serial
-from taxstamps.models import Stamp, Verification
-from taxstamps.services import outbox, statuslists
+from taxstamps.crypto.eddsa import SigningKey, verify_proof
+from taxstamps.crypto.statuslist import StatusList
+from taxstamps.domain.serials import SerialParts, build_serial, parse_serial
+from taxstamps.models import Stamp, Verification, utcnow
 
 
 class VerificationError(ValueError):
@@ -38,20 +55,23 @@ class VerificationError(ValueError):
 
 
 def _result(
-    outcome: str,
-    serial: str,
-    stamp: Stamp | None,
-    detail: str = "",
+    outcome: str, serial: str, stamp: Stamp | None, detail: str = ""
 ) -> dict[str, Any]:
-    body: dict[str, Any] = {"outcome": outcome, "serial": serial, "detail": detail}
-    if stamp is not None and stamp.first_scan_at is not None:
-        body["firstScan"] = {
-            "at": stamp.first_scan_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "verifierId": stamp.first_scan_verifier,
-            "latMicros": stamp.first_scan_lat_micros,
-            "longMicros": stamp.first_scan_long_micros,
+    result: dict[str, Any] = {"outcome": outcome, "serial": serial, "detail": detail}
+    if stamp is not None:
+        result["stamp"] = {
+            "status": stamp.status,
+            "category": stamp.category,
+            "dutyPaidKobo": stamp.duty_paid_kobo,
+            "validFrom": stamp.valid_from.isoformat(),
+            "validUntil": stamp.valid_until.isoformat(),
         }
-    return body
+        if stamp.first_scan_at is not None:
+            result["firstScan"] = {
+                "at": stamp.first_scan_at.isoformat(),
+                "verifierId": stamp.first_scan_verifier,
+            }
+    return result
 
 
 async def _record_attempt(
@@ -68,32 +88,16 @@ async def _record_attempt(
 ) -> None:
     session.add(
         Verification(
-            id=uuid.uuid4(),
-            stamp_id=stamp.id if stamp else None,
             serial_presented=serial_presented,
+            stamp_id=stamp.id if stamp is not None else None,
             verifier_id=verifier_id,
             public_scan=public_scan,
             outcome=outcome,
-            detail=detail,
+            detail=detail[:500],
             lat_micros=lat_micros,
             long_micros=long_micros,
         )
     )
-    await session.flush()
-
-
-async def _velocity_suspect(session: AsyncSession, stamp_id: uuid.UUID, settings: Settings) -> bool:
-    window_start = datetime.now(UTC) - timedelta(hours=settings.velocity_window_hours)
-    distinct = (
-        await session.execute(
-            select(func.count(func.distinct(Verification.verifier_id))).where(
-                Verification.stamp_id == stamp_id,
-                Verification.verified_at >= window_start,
-                Verification.verifier_id != "",
-            )
-        )
-    ).scalar_one()
-    return distinct >= settings.velocity_distinct_devices
 
 
 async def verify_stamp(
@@ -106,49 +110,62 @@ async def verify_stamp(
     signing_key: SigningKey,
     lat_micros: int | None = None,
     long_micros: int | None = None,
+    credential: dict[str, Any] | None = None,
+    consume: bool = True,
+    status_lists: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """First-scan-wins verification. Always records the attempt."""
+    """First-scan-wins verification. Always records the attempt.
+
+    ``consume=True`` (authenticated field verification) requires the stamp's
+    verifiable credential and verifies its proof BEFORE consuming.
+    ``consume=False`` (public pre-check) never mutates the stamp."""
     presented = (serial or "").strip().upper()
     try:
         parts = parse_serial(presented)
-    except SerialError as exc:
+    except Exception as exc:
         await _record_attempt(
             session, serial_presented=presented[:64], stamp=None, verifier_id=verifier_id,
             public_scan=public_scan, outcome="malformed_serial", detail=str(exc),
             lat_micros=lat_micros, long_micros=long_micros,
         )
-        return _result("malformed_serial", presented, None, str(exc))
+        await session.flush()
+        return _result("malformed_serial", presented[:64], None, str(exc))
 
     stamp = (
         await session.execute(
             select(Stamp).where(Stamp.serial == parts.serial).with_for_update()
         )
-    ).scalars().first()
+    ).scalar_one_or_none()
+    now = utcnow()
+
     if stamp is None:
         await _record_attempt(
             session, serial_presented=parts.serial, stamp=None, verifier_id=verifier_id,
-            public_scan=public_scan, outcome="unknown_serial", detail="",
+            public_scan=public_scan, outcome="unknown_serial", detail="serial not issued",
             lat_micros=lat_micros, long_micros=long_micros,
         )
-        return _result("unknown_serial", parts.serial, None)
+        await session.flush()
+        return _result("unknown_serial", parts.serial, None, "serial not issued")
 
-    # Terminal stamp states short-circuit (still recorded).
-    now = datetime.now(UTC)
     if stamp.status == "VOID":
         await _record_attempt(
             session, serial_presented=parts.serial, stamp=stamp, verifier_id=verifier_id,
-            public_scan=public_scan, outcome="void", detail="",
+            public_scan=public_scan, outcome="void", detail="stamp voided",
             lat_micros=lat_micros, long_micros=long_micros,
         )
-        return _result("void", parts.serial, stamp)
-    if stamp.status == "EXPIRED" or stamp.valid_until <= now:
+        await session.flush()
+        return _result("void", parts.serial, stamp, "stamp voided")
+
+    if now < stamp.valid_from or now > stamp.valid_until:
         await _record_attempt(
             session, serial_presented=parts.serial, stamp=stamp, verifier_id=verifier_id,
-            public_scan=public_scan, outcome="expired", detail="",
+            public_scan=public_scan, outcome="expired", detail="outside validity window",
             lat_micros=lat_micros, long_micros=long_micros,
         )
-        return _result("expired", parts.serial, stamp)
-    if stamp.status == "CONSUMED" or stamp.first_scan_at is not None:
+        await session.flush()
+        return _result("expired", parts.serial, stamp, "outside validity window")
+
+    if stamp.status == "CONSUMED":
         suspect = stamp.first_scan_verifier != verifier_id and verifier_id != ""
         outcome = "clone_suspect" if suspect else "already_verified"
         await _record_attempt(
@@ -157,119 +174,130 @@ async def verify_stamp(
             lat_micros=lat_micros, long_micros=long_micros,
         )
         if suspect:
-            stamp.status = "SUSPECT"
-            await statuslists.set_flag(
-                session, purpose="suspect", index=stamp.status_list_index,
-                settings=settings, signing_key=signing_key,
-                verification_method=f"{settings.issuer_did}#ed25519-{signing_key.kid}",
-            )
+            from taxstamps.services import statuslists
+
+            await statuslists.set_bit(session, stamp=stamp, purpose="suspect", key=signing_key)
         await session.flush()
         return _result(outcome, parts.serial, stamp, "repeat scan")
+
     if stamp.status != "ACTIVE":
         await _record_attempt(
             session, serial_presented=parts.serial, stamp=stamp, verifier_id=verifier_id,
             public_scan=public_scan, outcome="not_active", detail=f"stamp is {stamp.status}",
             lat_micros=lat_micros, long_micros=long_micros,
         )
+        await session.flush()
         return _result("not_active", parts.serial, stamp, f"stamp is {stamp.status}")
+
+    # First scan on an ACTIVE stamp.
+    if not consume:
+        # Public non-consuming pre-check: report state, mutate nothing. The
+        # stamp stays ACTIVE for the credential-bearing field scan.
+        await _record_attempt(
+            session, serial_presented=parts.serial, stamp=stamp, verifier_id=verifier_id,
+            public_scan=public_scan, outcome="active", detail="non-consuming pre-check",
+            lat_micros=lat_micros, long_micros=long_micros,
+        )
+        await session.flush()
+        return _result("active", parts.serial, stamp, "non-consuming pre-check")
+
+    # H3: the VC proof is verified BEFORE the stamp is consumed. The serial
+    # alone is enumerable and never a capability.
+    failures = _credential_failures(credential, parts.serial, signing_key, status_lists or {})
+    if failures:
+        detail = "; ".join(failures)
+        await _record_attempt(
+            session, serial_presented=parts.serial, stamp=stamp, verifier_id=verifier_id,
+            public_scan=public_scan, outcome="invalid_credential", detail=detail,
+            lat_micros=lat_micros, long_micros=long_micros,
+        )
+        await session.flush()
+        return _result("invalid_credential", parts.serial, stamp, detail)
 
     # First scan wins: consume the stamp.
     stamp.status = "CONSUMED"
     stamp.first_scan_at = now
     stamp.first_scan_verifier = verifier_id
-    stamp.first_scan_lat_micros = lat_micros
-    stamp.first_scan_long_micros = long_micros
     await _record_attempt(
         session, serial_presented=parts.serial, stamp=stamp, verifier_id=verifier_id,
-        public_scan=public_scan, outcome="valid", detail="first scan",
+        public_scan=public_scan, outcome="valid", detail="first scan consumes stamp",
         lat_micros=lat_micros, long_micros=long_micros,
     )
-    velocity = await _velocity_suspect(session, stamp.id, settings)
-    await outbox.enqueue(
-        session,
-        event_type="stamps.verified.v1",
-        resource={
-            "serial": stamp.serial,
-            "batchId": str(stamp.batch_id),
-            "verifierId": verifier_id,
-            "publicScan": public_scan,
-            "latMicros": lat_micros,
-            "longMicros": long_micros,
-            "velocitySuspect": velocity,
-        },
-        signing_key=signing_key,
-        principal_id=verifier_id or "public",
-        principal_role="verifier",
-        correlation_id=stamp.declaration_ref,
-    )
     await session.flush()
-    return _result("valid", parts.serial, stamp, "first scan")
+    return _result("valid", parts.serial, stamp, "first scan consumes stamp")
 
 
-async def void_stamp(
-    session: AsyncSession,
-    *,
-    serial: str,
-    reason: str,
-    principal_sub: str,
-    settings: Settings,
-    signing_key: SigningKey,
-) -> Stamp:
-    """Void a stamp (reason required): sets the ``void`` status-list bit."""
-    if not reason or not reason.strip():
-        raise VerificationError("reason-required", "void requires a reason")
-    stamp = (
+async def verification_velocity(
+    session: AsyncSession, *, stamp_id: Any, window_hours: int
+) -> int:
+    """Distinct verifier count in the trailing window (velocity signal)."""
+    since = datetime.now(UTC).timestamp() - window_hours * 3600
+    row = (
         await session.execute(
-            select(Stamp).where(Stamp.serial == serial.strip().upper()).with_for_update()
+            select(func.count(func.distinct(Verification.verifier_id))).where(
+                Verification.stamp_id == stamp_id,
+                Verification.scanned_at >= datetime.fromtimestamp(since, UTC),
+            )
         )
-    ).scalars().first()
-    if stamp is None:
-        raise VerificationError("not-found", "unknown serial")
-    if stamp.status == "VOID":
-        return stamp
-    stamp.status = "VOID"
-    await statuslists.set_flag(
-        session, purpose="void", index=stamp.status_list_index,
-        settings=settings, signing_key=signing_key,
-        verification_method=f"{settings.issuer_did}#ed25519-{signing_key.kid}",
-    )
-    await outbox.enqueue(
-        session,
-        event_type="stamps.voided.v1",
-        resource={"serial": stamp.serial, "reason": reason, "batchId": str(stamp.batch_id)},
-        signing_key=signing_key,
-        principal_id=principal_sub,
-        principal_role="excise-approver",
-        correlation_id=stamp.declaration_ref,
-    )
-    await session.flush()
-    return stamp
+    ).scalar_one()
+    return int(row)
+
+
+def reissue_serial(parts: SerialParts, sequence: int) -> str:
+    """Serial for a replacement stamp (same category/year, new sequence)."""
+    return build_serial(parts.category, parts.year, sequence)
 
 
 def verify_credential_offline(
     credential: dict[str, Any],
-    public_key: Any,
-    status_lists: dict[str, Any],
+    issuer_public_key: bytes,
+    status_lists: dict[str, StatusList],
 ) -> list[str]:
-    """Public self-service checks: proof + status-list bits. Returns a list of
-    failure reason codes (empty == verifiable)."""
+    """Offline verification of the QR-carried credential: proof + status bits.
+
+    Returns a list of failure reasons (empty == valid). Air-gap safe: needs
+    only the issuer public key and the cached status lists."""
     failures: list[str] = []
+    if not verify_proof(credential, issuer_public_key):
+        failures.append("bad-proof")
+    subject = credential.get("credentialSubject", {})
+    until = subject.get("validUntil") or credential.get("validUntil", "")
     try:
-        verify_proof(credential, public_key)
-    except VCError as exc:
-        failures.append(exc.reason)
-    statuses = credential.get("credentialStatus", [])
-    if isinstance(statuses, dict):
-        statuses = [statuses]
-    for entry in statuses:
-        purpose = entry.get("statusPurpose")
+        expiry = datetime.strptime(str(until), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        if datetime.now(UTC) > expiry:
+            failures.append("credential-expired")
+    except ValueError:
+        failures.append("malformed-validity")
+    for entry in credential.get("credentialStatus", []) or []:
+        purpose = entry.get("statusPurpose", "")
         index = int(entry.get("statusListIndex", "0"))
         status_list = status_lists.get(purpose)
         if status_list is None:
-            failures.append(f"status-list-unavailable:{purpose}")
+            # An unpublished list has no flags by construction: flags are
+            # only ever set by publishing the list credential. Treating the
+            # absence as a failure would break every unflagged credential
+            # (and does not weaken detection of actually-flagged stamps).
             continue
         if status_list.get(index):
             failures.append(f"status-flagged:{purpose}")
+    return failures
+
+
+def _credential_failures(
+    credential: dict[str, Any] | None,
+    serial: str,
+    signing_key: SigningKey,
+    status_lists: dict[str, Any],
+) -> list[str]:
+    """Fail-closed consumption gate: the presented credential must carry a
+    valid issuer proof, match the presented serial, and be unflagged on every
+    status-list purpose."""
+    if credential is None:
+        return ["credential-required"]
+    failures = verify_credential_offline(credential, signing_key.public_key, status_lists)
+    subject_serial = credential.get("credentialSubject", {}).get("serial")
+    if subject_serial != serial:
+        failures.append("credential-serial-mismatch")
     return failures
 
 
