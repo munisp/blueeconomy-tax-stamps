@@ -164,3 +164,12 @@ CI: `ci/github-actions.yml.example` — intentionally not under
 
 Apache-2.0. All dependencies are permissively licensed (MIT / Apache-2.0 /
 BSD); see `pyproject.toml` comments.
+
+## Reserved schema note (Phase 20)
+
+Migration 0001 creates a `principals` table that no code reads or writes — a
+copy-pasted skeleton shared with other services. It is retained in the
+schema for audit history but is intentionally unused; the ORM model was
+removed in Phase 20. `serial_counters` is managed via raw SQL in
+`services/issuance.py` (atomic ON CONFLICT claims); its ORM class was
+likewise removed as dead code.
