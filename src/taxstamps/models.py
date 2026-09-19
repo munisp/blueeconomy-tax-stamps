@@ -37,17 +37,6 @@ class Base(DeclarativeBase):
 # ---------------------------------------------------------------- principals
 
 
-class Principal(Base):
-    """Platform identity resolved from a verified OIDC token."""
-
-    __tablename__ = "principals"
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    subject: Mapped[str] = mapped_column(String(256), unique=True)  # OIDC sub
-    display_name: Mapped[str] = mapped_column(String(256), default="")
-    tenant: Mapped[str] = mapped_column(String(128), default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-
 class VerifierCredential(Base):
     """Per-verifier credential for the authenticated verification API.
 
@@ -235,16 +224,6 @@ class LedgerEntry(Base):
 
 
 # ------------------------------------------------------------------- stamps
-
-
-class SerialCounter(Base):
-    """Atomic serial-block claims: INSERT ... ON CONFLICT + UPDATE ...
-    RETURNING in one transaction."""
-
-    __tablename__ = "serial_counters"
-    category_code: Mapped[str] = mapped_column(String(3), primary_key=True)
-    year: Mapped[int] = mapped_column(Integer, primary_key=True)
-    next_sequence: Mapped[int] = mapped_column(BigInteger, default=0)
 
 
 BATCH_STATUSES = (
